@@ -2,13 +2,16 @@
 """
 Fast standalone spread viewer — no full backtest pipeline.
 
-Plots minute-level RTH spreads for a pair (A, B):
+Plots minute-level RTH **return spreads** for a pair (A, B):
 
-  1. A − B
-  2. A − β₅×B   (prior 5 session daily returns, known pre-open)
-  3. A − β₁₀×B  (prior 10 sessions)
-  4. A − β₂₀×B  (prior 20 sessions)
-  5. A − β_D×B  (β from prior session 15-min returns: 9:45, 10:00, … 15:45)
+  1. r_A − r_B
+  2. r_A − β₅×r_B   (β from prior 5 session daily returns, known pre-open)
+  3. r_A − β₁₀×r_B
+  4. r_A − β₂₀×r_B
+  5. r_A − β_D×r_B   (β from prior session 15-min returns: 9:45, 10:00, …)
+
+Charts show the **cumulative session return spread** (cumsum from open, resets each day).
+Use ``--return-view minute`` for raw 1-min return spreads instead.
 
 Usage::
 
@@ -39,11 +42,11 @@ from silver_backtesting.spread import (
 
 
 SPREAD_SPECS: list[tuple[str, str]] = [
-    ("A − B", "spread_raw"),
-    ("A − β₅×B", "spread_b5"),
-    ("A − β₁₀×B", "spread_b10"),
-    ("A − β₂₀×B", "spread_b20"),
-    ("A − β_D×B (prior day 15m)", "spread_bD"),
+    ("r_A − r_B", "spread_raw"),
+    ("r_A − β₅×r_B", "spread_b5"),
+    ("r_A − β₁₀×r_B", "spread_b10"),
+    ("r_A − β₂₀×r_B", "spread_b20"),
+    ("r_A − β_D×r_B (prior day 15m)", "spread_bD"),
 ]
 
 
@@ -68,6 +71,13 @@ def _parse_args() -> argparse.Namespace:
         choices=("day", "range"),
         default="day",
         help="'day' = one session overlay; 'range' = all RTH minutes in window (5 subplots).",
+    )
+    p.add_argument(
+        "--return-view",
+        choices=("cumulative", "minute"),
+        default="cumulative",
+        help="'cumulative' = cumsum of return spread from each session open (default); "
+        "'minute' = raw 1-min return spread.",
     )
     p.add_argument(
         "--data-folder",
@@ -186,13 +196,22 @@ def prior_session_15m_beta_by_date(
     return pd.Series(lagged, name="beta_D")
 
 
+def _attach_minute_returns(df: pd.DataFrame, ticker_a: str, ticker_b: str) -> pd.DataFrame:
+    """1-min pct returns within each session (valid consecutive RTH bars only)."""
+    out = df.copy()
+    valid = out.groupby("Trading date")["DT"].diff().eq(pd.Timedelta(minutes=1))
+    out["ret_a"] = out.groupby("Trading date")[ticker_a].pct_change().where(valid)
+    out["ret_b"] = out.groupby("Trading date")[ticker_b].pct_change().where(valid)
+    return out
+
+
 def attach_spread_columns(
     df: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
 ) -> pd.DataFrame:
-    """Add beta columns and five dollar spread levels."""
-    out = df.copy()
+    """Add beta columns and five minute return spreads (r_A − β×r_B)."""
+    out = _attach_minute_returns(df, ticker_a, ticker_b)
     beta5 = lookback_beta_by_trading_date(
         out, ticker_a, ticker_b, lookback_days=5, lag_sessions=1
     )
@@ -209,13 +228,23 @@ def attach_spread_columns(
     out["beta20"] = out["Trading date"].map(beta20)
     out["beta_D"] = out["Trading date"].map(beta_d)
 
-    a = out[ticker_a]
-    b = out[ticker_b]
-    out["spread_raw"] = a - b
-    out["spread_b5"] = a - out["beta5"] * b
-    out["spread_b10"] = a - out["beta10"] * b
-    out["spread_b20"] = a - out["beta20"] * b
-    out["spread_bD"] = a - out["beta_D"] * b
+    ra, rb = out["ret_a"], out["ret_b"]
+    out["spread_raw"] = ra - rb
+    out["spread_b5"] = ra - out["beta5"] * rb
+    out["spread_b10"] = ra - out["beta10"] * rb
+    out["spread_b20"] = ra - out["beta20"] * rb
+    out["spread_bD"] = ra - out["beta_D"] * rb
+    return out
+
+
+def plot_spread_columns(df: pd.DataFrame, return_view: str) -> pd.DataFrame:
+    """Return columns to plot (cumulative session path or raw minute spreads)."""
+    cols = [col for _, col in SPREAD_SPECS]
+    if return_view == "minute":
+        return df
+    out = df.copy()
+    for col in cols:
+        out[col] = out.groupby("Trading date", group_keys=False)[col].cumsum()
     return out
 
 
@@ -231,11 +260,18 @@ def _beta_summary_row(df: pd.DataFrame, td: int) -> pd.Series:
     )
 
 
+def _yaxis_title(return_view: str) -> str:
+    if return_view == "minute":
+        return "1-min return spread"
+    return "Cumulative return spread (from open)"
+
+
 def figure_intraday_day(
     df: pd.DataFrame,
     td: int,
     ticker_a: str,
     ticker_b: str,
+    return_view: str = "cumulative",
 ) -> go.Figure:
     """All five spreads overlaid for one session."""
     sub = df.loc[df["Trading date"] == td].sort_values("DT")
@@ -256,10 +292,11 @@ def figure_intraday_day(
     betas = _beta_summary_row(df, td)
     beta_txt = " | ".join(f"{k}={v:.3f}" if pd.notna(v) else f"{k}=n/a" for k, v in betas.items())
 
+    view_note = "cumulative from open" if return_view == "cumulative" else "1-min returns"
     fig.update_layout(
-        title=f"{ticker_a} vs {ticker_b} spreads — {td}<br><sup>{beta_txt}</sup>",
+        title=f"{ticker_a} vs {ticker_b} return spreads — {td} ({view_note})<br><sup>{beta_txt}</sup>",
         xaxis_title="Time (ET)",
-        yaxis_title="Spread level ($)",
+        yaxis_title=_yaxis_title(return_view),
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         height=560,
@@ -273,6 +310,7 @@ def figure_range(
     df: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
+    return_view: str = "cumulative",
 ) -> go.Figure:
     """Five stacked subplots for the full date window."""
     fig = make_subplots(
@@ -299,12 +337,17 @@ def figure_range(
         )
         fig.add_hline(y=0, line_dash="dot", line_color="#ccc", row=i, col=1)
 
+    view_note = "cumulative from open" if return_view == "cumulative" else "1-min returns"
     fig.update_layout(
-        title=f"{ticker_a} vs {ticker_b} — RTH minute spreads ({df['Trading date'].min()}–{df['Trading date'].max()})",
+        title=(
+            f"{ticker_a} vs {ticker_b} — RTH return spreads "
+            f"({df['Trading date'].min()}–{df['Trading date'].max()}, {view_note})"
+        ),
         template="plotly_white",
         height=900,
     )
     fig.update_xaxes(title_text="Time (ET)", row=5, col=1)
+    fig.update_yaxes(title_text=_yaxis_title(return_view))
     return fig
 
 
@@ -318,6 +361,7 @@ def main() -> None:
     print(f"  {len(df):,} RTH minutes ({df['Trading date'].nunique()} sessions)")
 
     df = attach_spread_columns(df, ticker_a, ticker_b)
+    plot_df = plot_spread_columns(df, args.return_view)
 
     focus_td = args.date or int(df["Trading date"].max())
     if focus_td not in set(df["Trading date"].astype(int)):
@@ -327,9 +371,11 @@ def main() -> None:
     print(_beta_summary_row(df, focus_td).to_string())
 
     if args.mode == "day":
-        fig = figure_intraday_day(df, focus_td, ticker_a, ticker_b)
+        fig = figure_intraday_day(
+            plot_df, focus_td, ticker_a, ticker_b, args.return_view
+        )
     else:
-        fig = figure_range(df, ticker_a, ticker_b)
+        fig = figure_range(plot_df, ticker_a, ticker_b, args.return_view)
 
     if args.output:
         out_path = args.output
