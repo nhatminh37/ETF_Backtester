@@ -12,9 +12,11 @@ Take profit (each 20%% of **initial** size, 5 levels):
   Long:  entry+0.6, +0.7, +0.8, +0.9, +1.0 pct pts above entry (default 2.1…2.5)
   Short: mirror below entry
 
-Stop loss (on remaining size):
-  Retrace to entry−1.0 pct → cut 50%% of remaining once
-  Retrace to 0 (vs open)   → exit all remaining
+Stop loss (full exit on remaining size):
+  Long:  session cum retraces to +1.0%%
+  Short: session cum retraces to −1.0%%
+
+At most one entry per session (first long or short signal only).
 
 Any size left at 15:59 → closed at session cum_diff.
 
@@ -51,12 +53,10 @@ class StrategyParams:
     tp_step_pct: float = 0.1
     tp_slices: int = 5
     tp_frac: float = 0.20
-    stop_partial_pct: float = 0.5
-    stop_partial_cut: float = 0.50
-    stop_full_pct: float = 0.0
+    stop_full_pct: float = 1.0
     notional: float = 10_000.0
     return_minutes: int = 5
-    one_trade_per_side_per_day: bool = True
+    one_trade_per_day: bool = True
 
 
 @dataclass
@@ -66,7 +66,6 @@ class OpenPosition:
     entry_dt: pd.Timestamp
     remaining: float = 1.0
     tp_hit: set[float] = field(default_factory=set)
-    stop_partial_done: bool = False
 
 
 def _tp_levels(side: str, p: StrategyParams) -> list[float]:
@@ -125,11 +124,9 @@ def _manage_position(
     if pos.remaining <= 1e-9:
         pos.remaining = 0.0
         return
-    entry_dec = _pct(p.entry_pct)
-    stop_partial = (
-        _pct(p.stop_partial_pct) if pos.side == "long" else -_pct(p.stop_partial_pct)
+    stop_full = (
+        _pct(p.stop_full_pct) if pos.side == "long" else -_pct(p.stop_full_pct)
     )
-    stop_full = _pct(p.stop_full_pct)
 
     for level in _tp_levels(pos.side, p):
         if level in pos.tp_hit or pos.remaining <= 0:
@@ -154,28 +151,6 @@ def _manage_position(
             remaining=pos.remaining,
             notional=p.notional,
         )
-
-    if pos.remaining > 0 and not pos.stop_partial_done:
-        hit = cum <= stop_partial if pos.side == "long" else cum >= stop_partial
-        if hit:
-            frac = pos.remaining * p.stop_partial_cut
-            if frac > 0:
-                pnl = _long_pnl(pos.side, pos.entry_cum, cum, frac)
-                pos.remaining -= frac
-                pos.stop_partial_done = True
-                _record_fill(
-                    fills,
-                    td=td,
-                    side=pos.side,
-                    reason=f"Stop@{p.stop_partial_pct}% (cut {p.stop_partial_cut:.0%})",
-                    dt=dt,
-                    frac=frac,
-                    entry_cum=pos.entry_cum,
-                    exit_cum=cum,
-                    pnl_dec=pnl,
-                    remaining=pos.remaining,
-                    notional=p.notional,
-                )
 
     if pos.remaining > 0:
         hit = cum <= stop_full if pos.side == "long" else cum >= stop_full
@@ -207,8 +182,7 @@ def simulate_session(
     fills: list[dict] = []
     long_pos: OpenPosition | None = None
     short_pos: OpenPosition | None = None
-    long_used = False
-    short_used = False
+    session_used = False
 
     entry_long = _pct(p.entry_pct)
     entry_short = -entry_long
@@ -220,49 +194,45 @@ def simulate_session(
         cum = float(row.cum_diff_ret)
         dt = row.DT
 
-        if (
-            long_pos is None
-            and not long_used
-            and cum >= entry_long
+        can_enter = (
+            not session_used
+            and long_pos is None
+            and short_pos is None
             and pd.notna(row.beta_D)
-        ):
-            long_used = True
-            long_pos = OpenPosition("long", cum, dt)
-            _record_fill(
-                fills,
-                td=td,
-                side="long",
-                reason=f"Entry (β_D={row.beta_D:.3f})",
-                dt=dt,
-                frac=0.0,
-                entry_cum=cum,
-                exit_cum=cum,
-                pnl_dec=0.0,
-                remaining=1.0,
-                notional=p.notional,
-            )
-
-        if (
-            short_pos is None
-            and not short_used
-            and cum <= entry_short
-            and pd.notna(row.beta_D)
-        ):
-            short_used = True
-            short_pos = OpenPosition("short", cum, dt)
-            _record_fill(
-                fills,
-                td=td,
-                side="short",
-                reason=f"Entry (β_D={row.beta_D:.3f})",
-                dt=dt,
-                frac=0.0,
-                entry_cum=cum,
-                exit_cum=cum,
-                pnl_dec=0.0,
-                remaining=1.0,
-                notional=p.notional,
-            )
+        )
+        if can_enter:
+            if cum >= entry_long:
+                session_used = True
+                long_pos = OpenPosition("long", cum, dt)
+                _record_fill(
+                    fills,
+                    td=td,
+                    side="long",
+                    reason=f"Entry (β_D={row.beta_D:.3f})",
+                    dt=dt,
+                    frac=0.0,
+                    entry_cum=cum,
+                    exit_cum=cum,
+                    pnl_dec=0.0,
+                    remaining=1.0,
+                    notional=p.notional,
+                )
+            elif cum <= entry_short:
+                session_used = True
+                short_pos = OpenPosition("short", cum, dt)
+                _record_fill(
+                    fills,
+                    td=td,
+                    side="short",
+                    reason=f"Entry (β_D={row.beta_D:.3f})",
+                    dt=dt,
+                    frac=0.0,
+                    entry_cum=cum,
+                    exit_cum=cum,
+                    pnl_dec=0.0,
+                    remaining=1.0,
+                    notional=p.notional,
+                )
 
         if long_pos is not None and long_pos.remaining > 0:
             _manage_position(long_pos, cum, dt, td, p, fills)
@@ -274,26 +244,26 @@ def simulate_session(
             if short_pos.remaining <= 0:
                 short_pos = None
 
-    for pos, side in ((long_pos, "long"), (short_pos, "short")):
-        if pos is not None and pos.remaining > 0:
-            exit_cum = float(day["cum_diff_ret"].iloc[-1])
-            exit_dt = day["DT"].iloc[-1]
-            frac = pos.remaining
-            pnl = _long_pnl(pos.side, pos.entry_cum, exit_cum, frac)
-            pos.remaining = 0.0
-            _record_fill(
-                fills,
-                td=td,
-                side=side,
-                reason="EOD",
-                dt=exit_dt,
-                frac=frac,
-                entry_cum=pos.entry_cum,
-                exit_cum=exit_cum,
-                pnl_dec=pnl,
-                remaining=0.0,
-                notional=p.notional,
-            )
+    active_pos = long_pos or short_pos
+    if active_pos is not None and active_pos.remaining > 0:
+        exit_cum = float(day["cum_diff_ret"].iloc[-1])
+        exit_dt = day["DT"].iloc[-1]
+        frac = active_pos.remaining
+        pnl = _long_pnl(active_pos.side, active_pos.entry_cum, exit_cum, frac)
+        active_pos.remaining = 0.0
+        _record_fill(
+            fills,
+            td=td,
+            side=active_pos.side,
+            reason="EOD",
+            dt=exit_dt,
+            frac=frac,
+            entry_cum=active_pos.entry_cum,
+            exit_cum=exit_cum,
+            pnl_dec=pnl,
+            remaining=0.0,
+            notional=p.notional,
+        )
 
     session_pnl = sum(f["PnL_$"] for f in fills if not str(f["Reason"]).startswith("Entry"))
     return fills, session_pnl
@@ -352,9 +322,9 @@ def summary_stats(daily_df: pd.DataFrame, fills_df: pd.DataFrame, p: StrategyPar
         ("Hedge β", "β_D (prior day 15m) in signal & PnL"),
         (
             "Stop loss",
-            f"retrace to {p.stop_partial_pct}% → cut {p.stop_partial_cut:.0%} once; "
-            f"retrace to {p.stop_full_pct}% → flat",
+            f"retrace to ±{p.stop_full_pct}% vs open → flat",
         ),
+        ("Max entries / session", 1 if p.one_trade_per_day else "unlimited"),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
