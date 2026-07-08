@@ -117,7 +117,7 @@ def compare_strict_vs_naive(
     cmp_df["extra_naive"] = cmp_df["naive_bars"] - cmp_df["strict_bars"]
     cmp_df = cmp_df.reset_index()
 
-    _header("1. STRICT vs NAIVE bar counts (gap artifact check)", out)
+    _header("1. STRICT vs NAIVE bar counts (should be ~equal for 5m grid)", out)
     print(f"  Total strict {return_minutes}m bars: {int(strict.sum())}", file=out)
     print(f"  Total naive  {return_minutes}m bars: {int(naive_cnt.sum())}", file=out)
     print(f"  Extra naive-only bars:   {int(cmp_df['extra_naive'].clip(lower=0).sum())}", file=out)

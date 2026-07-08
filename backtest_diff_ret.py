@@ -122,6 +122,9 @@ def _manage_position(
     p: StrategyParams,
     fills: list[dict],
 ) -> None:
+    if pos.remaining <= 1e-9:
+        pos.remaining = 0.0
+        return
     entry_dec = _pct(p.entry_pct)
     stop_partial = (
         _pct(p.stop_partial_pct) if pos.side == "long" else -_pct(p.stop_partial_pct)

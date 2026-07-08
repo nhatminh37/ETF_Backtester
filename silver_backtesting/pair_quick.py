@@ -122,20 +122,28 @@ def _valid_bar_returns(
     return_minutes: int,
 ) -> pd.DataFrame:
     """
-    N-minute returns only when every 1-min bar in [t−N, t] exists (no gaps).
+    Non-overlapping N-minute returns on the session grid (9:35, 9:40, … for N=5).
 
-    Skips timestamps with missing data so returns are not computed across holes.
+    Only when every 1-min bar in [t−N, t] exists (no gaps).
     """
     rows: list[dict] = []
     lag = pd.Timedelta(minutes=return_minutes)
+    step = lag
     one = pd.Timedelta(minutes=1)
 
     for td, group in df.groupby("Trading date"):
         g = group.sort_values("DT")
         dt_set = set(g["DT"])
         px = g.set_index("DT")[[ticker_a, ticker_b]]
+        session_start = g["DT"].iloc[0]
 
         for dt in g["DT"]:
+            if dt <= session_start:
+                continue
+            # One return per N-minute clock bucket (not overlapping every minute).
+            if (dt - session_start) % step != pd.Timedelta(0):
+                continue
+
             prev = dt - lag
             if prev not in dt_set:
                 continue
