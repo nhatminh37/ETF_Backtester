@@ -228,7 +228,7 @@ def simulate_session(
                 fills,
                 td=td,
                 side="long",
-                reason="Entry",
+                reason=f"Entry (β_D={row.beta_D:.3f})",
                 dt=dt,
                 frac=0.0,
                 entry_cum=cum,
@@ -250,7 +250,7 @@ def simulate_session(
                 fills,
                 td=td,
                 side="short",
-                reason="Entry",
+                reason=f"Entry (β_D={row.beta_D:.3f})",
                 dt=dt,
                 frac=0.0,
                 entry_cum=cum,
@@ -291,7 +291,7 @@ def simulate_session(
                 notional=p.notional,
             )
 
-    session_pnl = sum(f["PnL_$"] for f in fills if f["Reason"] != "Entry")
+    session_pnl = sum(f["PnL_$"] for f in fills if not str(f["Reason"]).startswith("Entry"))
     return fills, session_pnl
 
 
@@ -307,7 +307,7 @@ def run_backtest(df: pd.DataFrame, p: StrategyParams) -> tuple[pd.DataFrame, pd.
         if not fills:
             continue
         all_fills.extend(fills)
-        entries = [f for f in fills if f["Reason"] == "Entry"]
+        entries = [f for f in fills if str(f["Reason"]).startswith("Entry")]
         daily_rows.append(
             {
                 "Trading date": int(td),
@@ -330,7 +330,7 @@ def summary_stats(daily_df: pd.DataFrame, fills_df: pd.DataFrame, p: StrategyPar
     if daily_df.empty:
         return pd.DataFrame({"Metric": ["Trades"], "Value": [0]})
 
-    exits = fills_df[fills_df["Reason"] != "Entry"]
+    exits = fills_df[~fills_df["Reason"].astype(str).str.startswith("Entry")]
     total = daily_df["Session_PnL_$"].sum()
     win_days = (daily_df["Session_PnL_$"] > 0).sum()
     n_days = len(daily_df)
@@ -344,8 +344,19 @@ def summary_stats(daily_df: pd.DataFrame, fills_df: pd.DataFrame, p: StrategyPar
         ("Notional per full leg", p.notional),
         ("Entry threshold (%)", p.entry_pct),
         ("TP levels (%)", f"{p.tp_start_pct}…{p.tp_start_pct + (p.tp_slices - 1) * p.tp_step_pct} step {p.tp_step_pct}"),
+        ("Hedge β", "β_D (prior day 15m) in signal & PnL"),
+        (
+            "Stop loss",
+            f"retrace to {p.stop_partial_pct}% → cut {p.stop_partial_cut:.0%} once; "
+            f"retrace to {p.stop_full_pct}% → flat",
+        ),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
+
+
+def _trading_dates_for_plot(daily_df: pd.DataFrame) -> pd.Series:
+    """Convert YYYYMMDD ints to datetimes so Plotly shows readable dates."""
+    return pd.to_datetime(daily_df["Trading date"].astype(str), format="%Y%m%d")
 
 
 def build_report_html(
@@ -357,14 +368,15 @@ def build_report_html(
 ) -> str:
     fig = make_subplots(rows=2, cols=1, row_heights=[0.45, 0.55], vertical_spacing=0.08)
     if not daily_df.empty:
+        x_dates = _trading_dates_for_plot(daily_df)
         fig.add_trace(
-            go.Bar(x=daily_df["Trading date"], y=daily_df["Session_PnL_$"], name="Daily PnL"),
+            go.Bar(x=x_dates, y=daily_df["Session_PnL_$"], name="Daily PnL"),
             row=1,
             col=1,
         )
         fig.add_trace(
             go.Scatter(
-                x=daily_df["Trading date"],
+                x=x_dates,
                 y=daily_df["Cum_PnL_$"],
                 mode="lines",
                 name="Cumulative PnL",
@@ -372,7 +384,15 @@ def build_report_html(
             row=2,
             col=1,
         )
-    fig.update_layout(template="plotly_white", height=700, title="diff_ret ladder backtest")
+    fig.update_layout(
+        template="plotly_white",
+        height=700,
+        title="diff_ret ladder backtest (β_D hedged cum spread)",
+    )
+    fig.update_xaxes(title_text="Trading date", row=1, col=1)
+    fig.update_xaxes(title_text="Trading date", row=2, col=1)
+    fig.update_yaxes(title_text="Daily PnL ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Cumulative PnL ($)", row=2, col=1)
     chart = fig.to_html(full_html=False, include_plotlyjs="cdn")
 
     summary_html = summary.to_html(index=False, classes="data-table", border=0)
