@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "silver-backtesting"
+version = "0.1.0"
+description = "Silver stocks intraday spread backtesting"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "numpy",
+    "pandas-market-calendars",
+    "pytz",
+    "yfinance",
+    "plotly",
+    "openpyxl",
+]
+
+[project.optional-dependencies]
+ui = ["dash", "ipywidgets"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["silver_backtesting*"]
