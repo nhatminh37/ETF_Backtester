@@ -6,7 +6,7 @@ Checks:
   - 1-min data coverage & gaps per session
   - strict vs naive 5m bar counts (gap-fill false signals)
   - large |diff_ret| / cum_diff jumps
-  - entry / TP / SL / EOD fill breakdown
+  - entry / TP / EOD fill breakdown
   - worst & best PnL days with full fill trail
 
 Usage::

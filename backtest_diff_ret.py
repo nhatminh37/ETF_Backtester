@@ -12,10 +12,6 @@ Take profit (each 20%% of **initial** size, 5 levels):
   Long:  entry+0.6, +0.7, +0.8, +0.9, +1.0 pct pts above entry (default 2.1…2.5)
   Short: mirror below entry
 
-Stop loss (full exit on remaining size):
-  Long:  session cum retraces to +1.0%%
-  Short: session cum retraces to −1.0%%
-
 At most one entry per session (first long or short signal only).
 
 Any size left at 15:59 → closed at session cum_diff.
@@ -53,7 +49,6 @@ class StrategyParams:
     tp_step_pct: float = 0.1
     tp_slices: int = 5
     tp_frac: float = 0.20
-    stop_full_pct: float = 1.0
     notional: float = 10_000.0
     return_minutes: int = 5
     one_trade_per_day: bool = True
@@ -124,9 +119,6 @@ def _manage_position(
     if pos.remaining <= 1e-9:
         pos.remaining = 0.0
         return
-    stop_full = (
-        _pct(p.stop_full_pct) if pos.side == "long" else -_pct(p.stop_full_pct)
-    )
 
     for level in _tp_levels(pos.side, p):
         if level in pos.tp_hit or pos.remaining <= 0:
@@ -151,26 +143,6 @@ def _manage_position(
             remaining=pos.remaining,
             notional=p.notional,
         )
-
-    if pos.remaining > 0:
-        hit = cum <= stop_full if pos.side == "long" else cum >= stop_full
-        if hit:
-            frac = pos.remaining
-            pnl = _long_pnl(pos.side, pos.entry_cum, cum, frac)
-            pos.remaining = 0.0
-            _record_fill(
-                fills,
-                td=td,
-                side=pos.side,
-                reason=f"Stop@{p.stop_full_pct}% (flat)",
-                dt=dt,
-                frac=frac,
-                entry_cum=pos.entry_cum,
-                exit_cum=cum,
-                pnl_dec=pnl,
-                remaining=0.0,
-                notional=p.notional,
-            )
 
 
 def simulate_session(
@@ -320,10 +292,7 @@ def summary_stats(daily_df: pd.DataFrame, fills_df: pd.DataFrame, p: StrategyPar
         ("TP levels (%)", f"{p.tp_start_pct}…{p.tp_start_pct + (p.tp_slices - 1) * p.tp_step_pct} step {p.tp_step_pct}"),
         ("Return bar (min)", p.return_minutes),
         ("Hedge β", "β_D (prior day 15m) in signal & PnL"),
-        (
-            "Stop loss",
-            f"retrace to ±{p.stop_full_pct}% vs open → flat",
-        ),
+        ("Stop loss", "none"),
         ("Max entries / session", 1 if p.one_trade_per_day else "unlimited"),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
