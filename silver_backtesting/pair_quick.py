@@ -115,6 +115,58 @@ def prior_session_15m_beta_by_date(
     return pd.Series(lagged, name="beta_D")
 
 
+def _valid_bar_returns(
+    df: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    return_minutes: int,
+) -> pd.DataFrame:
+    """
+    N-minute returns only when every 1-min bar in [t−N, t] exists (no gaps).
+
+    Skips timestamps with missing data so returns are not computed across holes.
+    """
+    rows: list[dict] = []
+    lag = pd.Timedelta(minutes=return_minutes)
+    one = pd.Timedelta(minutes=1)
+
+    for td, group in df.groupby("Trading date"):
+        g = group.sort_values("DT")
+        dt_set = set(g["DT"])
+        px = g.set_index("DT")[[ticker_a, ticker_b]]
+
+        for dt in g["DT"]:
+            prev = dt - lag
+            if prev not in dt_set:
+                continue
+
+            t = prev
+            missing = False
+            while t <= dt:
+                if t not in dt_set:
+                    missing = True
+                    break
+                t += one
+            if missing:
+                continue
+
+            pa0, pa1 = px.at[prev, ticker_a], px.at[dt, ticker_a]
+            pb0, pb1 = px.at[prev, ticker_b], px.at[dt, ticker_b]
+            if any(pd.isna(v) or v == 0 for v in (pa0, pa1, pb0, pb1)):
+                continue
+
+            rows.append(
+                {
+                    "DT": dt,
+                    "Trading date": td,
+                    "ret_a": pa1 / pa0 - 1,
+                    "ret_b": pb1 / pb0 - 1,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
 def attach_diff_ret(
     df: pd.DataFrame,
     ticker_a: str,
@@ -124,35 +176,19 @@ def attach_diff_ret(
     """
     diff_ret = r_A − β_D×r_B on ``return_minutes`` bar returns; cumsum within session.
 
-    β_D is still from the prior session's 15-min returns (computed on the 1-min panel).
+    Returns are computed only on bars with full 1-min coverage (no gap filling).
+    β_D is from the prior session's 15-min returns (computed on the 1-min panel).
     """
     beta_d = prior_session_15m_beta_by_date(df, ticker_a, ticker_b)
-    freq = f"{return_minutes}min"
-    chunks: list[pd.DataFrame] = []
-
-    for td, group in df.groupby("Trading date"):
-        prices = (
-            group.set_index("DT")[[ticker_a, ticker_b]]
-            .sort_index()
-            .resample(freq, label="right", closed="right")
-            .last()
-            .dropna(how="all")
-        )
-        rets = prices.pct_change().dropna(how="any")
-        if rets.empty:
-            continue
-        chunk = rets.reset_index()
-        chunk["Trading date"] = td
-        chunk["beta_D"] = beta_d.get(int(td), float("nan"))
-        chunk["ret_a"] = chunk[ticker_a]
-        chunk["ret_b"] = chunk[ticker_b]
-        chunk["diff_ret"] = chunk["ret_a"] - chunk["beta_D"] * chunk["ret_b"]
-        chunk["ind_nyse_rth"] = True
-        chunks.append(chunk)
-
-    if not chunks:
+    bars = _valid_bar_returns(df, ticker_a, ticker_b, return_minutes)
+    if bars.empty:
         return df.iloc[:0].copy()
 
-    out = pd.concat(chunks, ignore_index=True)
-    out["cum_diff_ret"] = out.groupby("Trading date", group_keys=False)["diff_ret"].cumsum()
-    return out.sort_values("DT").reset_index(drop=True)
+    bars["beta_D"] = bars["Trading date"].map(beta_d)
+    bars["diff_ret"] = bars["ret_a"] - bars["beta_D"] * bars["ret_b"]
+    bars = bars[bars["beta_D"].notna() & bars["diff_ret"].notna()].copy()
+    if bars.empty:
+        return df.iloc[:0].copy()
+    bars["ind_nyse_rth"] = True
+    bars["cum_diff_ret"] = bars.groupby("Trading date", group_keys=False)["diff_ret"].cumsum()
+    return bars.sort_values("DT").reset_index(drop=True)

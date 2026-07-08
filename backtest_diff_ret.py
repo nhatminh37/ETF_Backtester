@@ -212,7 +212,7 @@ def simulate_session(
 
     for row in day.itertuples(index=False):
         dr = row.diff_ret
-        if pd.isna(dr):
+        if pd.isna(dr) or pd.isna(row.cum_diff_ret):
             continue
         cum = float(row.cum_diff_ret)
         dt = row.DT
@@ -465,12 +465,14 @@ def main() -> None:
 
     print(f"Loading {args.ticker_a}/{args.ticker_b} …")
     df = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
+    n_1m = len(df)
     df = attach_diff_ret(
         df, args.ticker_a, args.ticker_b, return_minutes=params.return_minutes
     )
     print(
         f"  {df['Trading date'].nunique()} sessions, "
-        f"{len(df):,} {params.return_minutes}m bars"
+        f"{len(df):,} valid {params.return_minutes}m bars "
+        f"(from {n_1m:,} 1-min rows; gaps skipped)"
     )
 
     fills_df, daily_df = run_backtest(df, params)
