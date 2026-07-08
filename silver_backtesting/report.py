@@ -127,6 +127,32 @@ def _trades_by_date(
     return by_date, columns
 
 
+def _spread_minute_by_date(
+    df_data: pd.DataFrame,
+    config: StrategyConfig,
+    spread: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Minute-level beta-adjusted spread grouped by trading date (for drill-down chart)."""
+    if spread not in df_data.columns:
+        return {}
+    ed = df_data["Trading date"].max()
+    mask = df_data["Trading date"].between(
+        config.backtest_start, ed, inclusive="both"
+    ) & (df_data["ind_nyse_rth"] == True)
+    sub = (
+        df_data.loc[mask, ["Trading date", "DT", spread]]
+        .dropna(subset=[spread])
+        .sort_values("DT")
+    )
+    by_date: dict[str, list[dict[str, Any]]] = {}
+    for td, grp in sub.groupby("Trading date"):
+        by_date[str(int(td))] = [
+            {"dt": str(row["DT"]), "spread": float(row[spread])}
+            for _, row in grp.iterrows()
+        ]
+    return by_date
+
+
 def _interactive_daily_section(
     spread: str,
     daily: pd.DataFrame,
@@ -148,7 +174,7 @@ def _interactive_daily_section(
     return f"""
     <section class="daily-section" id="daily-{spread_id}">
         <h2>Daily PnL — {escape(spread)}</h2>
-        <p class="hint">Click any date row to see all minute-level trades for that day.</p>
+        <p class="hint">Click any date row to see the minute-by-minute spread chart and trades for that day.</p>
         <table class="data-table daily-table">
             <thead><tr>{headers}</tr></thead>
             <tbody>{"".join(rows)}</tbody>
@@ -157,6 +183,7 @@ def _interactive_daily_section(
             <h3>Trades on <span id="trades-date-{spread_id}"></span>
                 <span id="trades-count-{spread_id}" class="trade-count"></span>
             </h3>
+            <div id="spread-chart-{spread_id}" class="intraday-spread-chart"></div>
             <div class="trades-scroll">
                 <table class="data-table trades-table">
                     <thead><tr>{trade_headers}</tr></thead>
@@ -211,6 +238,7 @@ _REPORT_STYLES = """
         .trades-panel.hidden { display: none; }
         .trades-scroll { max-height: 420px; overflow: auto; }
         .trade-count { color: #666; font-weight: normal; font-size: 14px; }
+        .intraday-spread-chart { height: 340px; margin: 1rem 0; }
 """
 
 
@@ -344,6 +372,54 @@ def _daily_rolling_correlation_figure(
     return fig
 
 
+def _beta_spread_price_figure(
+    df_data: pd.DataFrame | None,
+    config: StrategyConfig,
+) -> go.Figure | None:
+    """Every RTH minute of beta-adjusted spread: ticker − β×cmdty."""
+    if df_data is None or df_data.empty:
+        return None
+
+    ed = df_data["Trading date"].max()
+    fig = go.Figure()
+    for spread in config.backtest_spreads:
+        if spread not in df_data.columns:
+            continue
+        ticker, cmdty = spread.split("-", 1)
+        mask = df_data["Trading date"].between(
+            config.backtest_start, ed, inclusive="both"
+        ) & (df_data["ind_nyse_rth"] == True)
+        minute = (
+            df_data.loc[mask, ["DT", spread]]
+            .dropna(subset=[spread])
+            .sort_values("DT")
+        )
+        if minute.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=minute["DT"],
+                y=minute[spread],
+                mode="lines",
+                name=f"{ticker} − β×{cmdty}",
+            )
+        )
+
+    if not fig.data:
+        return None
+
+    fig.add_hline(y=0, line_dash="dot", line_color="#999")
+    fig.update_layout(
+        title="Beta-adjusted spread (1-min RTH): A − β×B",
+        xaxis_title="Time",
+        yaxis_title="Spread level ($)",
+        template="plotly_white",
+        legend_title_text="Pair",
+        height=480,
+    )
+    return fig
+
+
 def _daily_beta_figure(
     df_data: pd.DataFrame | None,
     config: StrategyConfig,
@@ -417,11 +493,45 @@ def _daily_beta_figure(
 _REPORT_SCRIPT = """
         const TRADES_DATA = __TRADES_JSON__;
         const TRADE_COLUMNS = __COLUMNS_JSON__;
+        const SPREAD_DATA = __SPREAD_JSON__;
 
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function showIntradaySpread(spreadId, date) {
+            const spreadKey = spreadId.replace(/_/g, '-');
+            const series = (SPREAD_DATA[spreadKey] || {})[String(date)] || [];
+            const el = document.getElementById(`spread-chart-${spreadId}`);
+            if (!series.length) {
+                el.innerHTML = '<p class="hint">No minute spread data for this date.</p>';
+                return;
+            }
+            Plotly.newPlot(
+                el,
+                [{
+                    x: series.map((p) => p.dt),
+                    y: series.map((p) => p.spread),
+                    mode: 'lines',
+                    name: spreadKey,
+                }],
+                {
+                    title: `Beta-adjusted spread — ${date}`,
+                    xaxis: { title: 'Time' },
+                    yaxis: { title: 'A − β×B ($)' },
+                    template: 'plotly_white',
+                    shapes: [{
+                        type: 'line',
+                        x0: 0, x1: 1, xref: 'paper',
+                        y0: 0, y1: 0,
+                        line: { dash: 'dot', color: '#999' },
+                    }],
+                    margin: { t: 40, r: 20, b: 40, l: 60 },
+                },
+                { responsive: true, displayModeBar: true }
+            );
         }
 
         function showTrades(spreadId, date) {
@@ -440,6 +550,8 @@ _REPORT_SCRIPT = """
             document.getElementById(`trades-date-${spreadId}`).textContent = date;
             document.getElementById(`trades-count-${spreadId}`).textContent =
                 `(${trades.length} trade${trades.length === 1 ? '' : 's'})`;
+
+            showIntradaySpread(spreadId, date);
 
             const tbody = document.getElementById(`trades-body-${spreadId}`);
             tbody.innerHTML = '';
@@ -487,6 +599,15 @@ def build_backtest_html(config: StrategyConfig, state: SilverBacktestState) -> s
             config={"displayModeBar": True},
         )
 
+    spread_chart_html = ""
+    spread_fig = _beta_spread_price_figure(state.df_data, config)
+    if spread_fig is not None:
+        spread_chart_html = spread_fig.to_html(
+            full_html=False,
+            include_plotlyjs=False,
+            config={"displayModeBar": True},
+        )
+
     summary_html = ""
     if state.backtest_summary is not None and not state.backtest_summary.empty:
         summary_display = state.backtest_summary.copy()
@@ -501,6 +622,7 @@ def build_backtest_html(config: StrategyConfig, state: SilverBacktestState) -> s
 
     trades_data: dict[str, dict[str, list[dict[str, Any]]]] = {}
     trade_columns: dict[str, list[str]] = {}
+    spread_data: dict[str, dict[str, list[dict[str, Any]]]] = {}
     daily_sections: list[str] = []
 
     for spread in config.backtest_spreads:
@@ -513,14 +635,20 @@ def build_backtest_html(config: StrategyConfig, state: SilverBacktestState) -> s
         by_date, cols = _trades_by_date(pregroup, spread, config.backtest_rt_col)
         trades_data[spread] = by_date
         trade_columns[spread] = cols
+        if state.df_data is not None:
+            spread_data[spread] = _spread_minute_by_date(
+                state.df_data, config, spread
+            )
         daily_sections.append(_interactive_daily_section(spread, daily, cols))
 
     daily_html = "\n".join(daily_sections)
     trades_json = json.dumps(trades_data)
     columns_json = json.dumps(trade_columns)
+    spread_json = json.dumps(spread_data)
     script = (
         _REPORT_SCRIPT.replace("__TRADES_JSON__", trades_json)
         .replace("__COLUMNS_JSON__", columns_json)
+        .replace("__SPREAD_JSON__", spread_json)
     )
 
     return f"""<!DOCTYPE html>
@@ -537,6 +665,11 @@ def build_backtest_html(config: StrategyConfig, state: SilverBacktestState) -> s
     <section>
         <h2>Cumulative PnL Chart</h2>
         <div class="chart-container">{chart_html}</div>
+    </section>
+    <section>
+        <h2>Beta-adjusted spread</h2>
+        <p class="hint">Every RTH minute: PAAS − β×SLV (β fixed each morning from prior 20 daily returns). Zoom with Plotly controls.</p>
+        <div class="chart-container">{spread_chart_html}</div>
     </section>
     <section>
         <h2>Rolling Correlation</h2>
