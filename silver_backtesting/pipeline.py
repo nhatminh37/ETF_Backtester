@@ -478,15 +478,26 @@ class SilverBacktestPipeline:
                 if ticker == cmdty:
                     continue
                 spread_col = f"{ticker}-{cmdty}"
-                px_t = df_data[ticker].where(df_data[ticker] > 0)
-                px_c = df_data[cmdty].where(df_data[cmdty] > 0)
-                log_spread = np.log(px_t) - np.log(px_c)
-                df_data[spread_col] = log_spread
-                df_data[f"{spread_col}_pctchg"] = log_spread.diff()
+                beta_col = f"{spread_col}_beta20"
+
+                df_data = attach_lookback_beta(
+                    df_data,
+                    ticker,
+                    cmdty,
+                    lookback_days=self.config.backtest_beta_lookback,
+                    lag_sessions=1,
+                )
+
+                beta = df_data[beta_col]
+                spread_level = df_data[ticker] - beta * df_data[cmdty]
+                df_data[spread_col] = spread_level
+                df_data[f"{spread_col}_pctchg"] = (
+                    spread_level.diff() / spread_level.abs()
+                )
                 valid_mask = df_data["DT"].diff().eq(
                     pd.Timedelta(minutes=1)
                 ) & df_data["ind_nyse_rth"]
-                df_data[f"{spread_col}_chg"] = log_spread.diff()
+                df_data[f"{spread_col}_chg"] = spread_level.diff()
                 df_data.loc[~valid_mask, f"{spread_col}_chg"] = np.nan
                 df_data.loc[~valid_mask, f"{spread_col}_pctchg"] = np.nan
                 df_data[f"{spread_col}_sqrd"] = (
@@ -514,19 +525,13 @@ class SilverBacktestPipeline:
                 ].shift(1)
                 df_data.loc[~valid_mask, f"{spread_col}_prevzscore"] = np.nan
 
-                df_data = attach_lookback_beta(
-                    df_data,
-                    ticker,
-                    cmdty,
-                    lookback_days=self.config.backtest_beta_lookback,
-                )
                 minutes_to_keep = select_minutes(starting_min)
                 df_data = forward_beta_hedged_return(
                     df_data,
                     ticker,
                     cmdty,
                     minutes_to_keep,
-                    beta_col=f"{spread_col}_beta20",
+                    beta_col=beta_col,
                 )
 
                 df_data = compute_ind_trend(

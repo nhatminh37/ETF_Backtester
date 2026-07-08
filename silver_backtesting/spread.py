@@ -121,6 +121,26 @@ def ols_beta(stock_ret: pd.Series, bench_ret: pd.Series) -> float:
     return float(aligned["s"].cov(aligned["b"]) / var_b)
 
 
+def pair_daily_returns(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+) -> pd.DataFrame | None:
+    """Session-to-session daily returns from last RTH print each day."""
+    if ticker not in df.columns or cmdty not in df.columns:
+        return None
+    mask = df["ind_nyse_rth"] == True
+    if not mask.any():
+        return None
+    daily_close = (
+        df.loc[mask, ["Trading date", ticker, cmdty]]
+        .groupby("Trading date")[[ticker, cmdty]]
+        .last()
+        .sort_index()
+    )
+    return daily_close.pct_change()
+
+
 def pair_15min_returns(
     df: pd.DataFrame,
     ticker: str,
@@ -162,25 +182,24 @@ def lookback_beta_by_trading_date(
     cmdty: str,
     lookback_days: int = 20,
     lag_sessions: int = 1,
-    bar_minutes: int = 15,
 ) -> pd.Series:
     """
-    OLS beta (ticker on cmdty) from pooled 15-min returns.
+    OLS beta (ticker on cmdty) from daily returns over a rolling session window.
 
     For session ``t``, uses the prior ``lookback_days`` sessions only when
     ``lag_sessions=1`` (no look-ahead within the trading day).
     """
-    fifteen_min = pair_15min_returns(df, ticker, cmdty, bar_minutes)
-    if fifteen_min is None or fifteen_min.empty:
+    daily_ret = pair_daily_returns(df, ticker, cmdty)
+    if daily_ret is None or daily_ret.empty:
         return pd.Series(dtype=float)
 
-    dates = sorted(fifteen_min["Trading date"].unique())
+    dates = list(daily_ret.index)
     betas: dict[int, float] = {}
     for i, td in enumerate(dates):
         if i < lookback_days + lag_sessions - 1:
             continue
         window_dates = dates[i - lookback_days - lag_sessions + 1 : i - lag_sessions + 1]
-        window = fifteen_min[fifteen_min["Trading date"].isin(window_dates)]
+        window = daily_ret.loc[window_dates]
         betas[int(td)] = ols_beta(window[ticker], window[cmdty])
     return pd.Series(betas, name="beta20")
 
@@ -192,6 +211,12 @@ def attach_lookback_beta(
     lookback_days: int = 20,
     lag_sessions: int = 1,
 ) -> pd.DataFrame:
+    """
+    Map OLS beta (ticker on cmdty) onto each row by ``Trading date``.
+
+    With ``lag_sessions=1`` (default), day *t* uses daily returns from the
+    prior ``lookback_days`` sessions only — known before the open.
+    """
     spread_col = f"{ticker}-{cmdty}"
     beta_by_date = lookback_beta_by_trading_date(
         df, ticker, cmdty, lookback_days=lookback_days, lag_sessions=lag_sessions

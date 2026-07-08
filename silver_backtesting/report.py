@@ -56,7 +56,8 @@ def _config_params_html(config: StrategyConfig) -> str:
         ("Spreads", ", ".join(config.backtest_spreads)),
         ("Return column", config.backtest_rt_col),
         ("Beta lookback (sessions)", config.backtest_beta_lookback),
-        ("Signal", "log(PAAS/SLV) 1-min change z-score"),
+        ("Signal", "z-score on Δ(A − β×B); β from prior 20 daily returns (pre-open)"),
+        ("Spread level", "A − β×B"),
         ("Hedge", "N ticker / N×beta20 cmdty"),
         ("Backtest start", config.backtest_start),
         ("Side", config.backtest_side),
@@ -108,7 +109,7 @@ def _trades_by_date(
     if "DT" in df.columns:
         df["DT"] = df["DT"].astype(str)
     if "ind_zscore2" in df.columns:
-        side_map = {1: "Short log spread", -1: "Long log spread", 0: "Flat"}
+        side_map = {1: "Short beta spread", -1: "Long beta spread", 0: "Flat"}
         df["Side"] = df["ind_zscore2"].map(side_map)
 
     columns = _trade_display_columns(spread, rt_col, df)
@@ -401,8 +402,8 @@ def _daily_beta_figure(
 
     fig.update_layout(
         title=(
-            f"Beta — intraday ({bar_minutes}m bars, day t only) vs "
-            f"{lookback_days}-day lookback ({bar_minutes}m returns, stock on SLV)"
+            f"Beta — intraday ({bar_minutes}m, day t) vs "
+            f"{lookback_days}-day lookback (daily returns, stock on SLV)"
         ),
         xaxis_title="Trading Date",
         yaxis_title="Beta",
@@ -547,8 +548,8 @@ def build_backtest_html(config: StrategyConfig, state: SilverBacktestState) -> s
         <p class="hint">
             <strong>Intraday (dotted):</strong> OLS beta from 15-min returns within day t only
             (9:45, 10:00, … through session close).<br>
-            <strong>20-day (solid):</strong> OLS beta from 15-min returns over the last 20 sessions (chart includes day t).<br>
-            Backtest hedge uses prior 20 sessions only (no same-day look-ahead).
+            <strong>20-day (solid):</strong> OLS beta from daily returns over the last 20 sessions (chart includes day t).<br>
+            Backtest hedge β uses prior 20 sessions of daily returns only (no same-day look-ahead).
         </p>
         <div class="chart-container">{beta_chart_html}</div>
     </section>
