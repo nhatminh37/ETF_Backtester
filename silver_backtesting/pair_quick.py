@@ -119,15 +119,40 @@ def attach_diff_ret(
     df: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
+    return_minutes: int = 5,
 ) -> pd.DataFrame:
-    """Minute diff_ret = r_A − β_D×r_B and session cumulative diff_ret."""
-    out = df.copy()
-    valid = out.groupby("Trading date")["DT"].diff().eq(pd.Timedelta(minutes=1))
-    out["ret_a"] = out.groupby("Trading date")[ticker_a].pct_change().where(valid)
-    out["ret_b"] = out.groupby("Trading date")[ticker_b].pct_change().where(valid)
+    """
+    diff_ret = r_A − β_D×r_B on ``return_minutes`` bar returns; cumsum within session.
 
-    beta_d = prior_session_15m_beta_by_date(out, ticker_a, ticker_b)
-    out["beta_D"] = out["Trading date"].map(beta_d)
-    out["diff_ret"] = out["ret_a"] - out["beta_D"] * out["ret_b"]
+    β_D is still from the prior session's 15-min returns (computed on the 1-min panel).
+    """
+    beta_d = prior_session_15m_beta_by_date(df, ticker_a, ticker_b)
+    freq = f"{return_minutes}min"
+    chunks: list[pd.DataFrame] = []
+
+    for td, group in df.groupby("Trading date"):
+        prices = (
+            group.set_index("DT")[[ticker_a, ticker_b]]
+            .sort_index()
+            .resample(freq, label="right", closed="right")
+            .last()
+            .dropna(how="all")
+        )
+        rets = prices.pct_change().dropna(how="any")
+        if rets.empty:
+            continue
+        chunk = rets.reset_index()
+        chunk["Trading date"] = td
+        chunk["beta_D"] = beta_d.get(int(td), float("nan"))
+        chunk["ret_a"] = chunk[ticker_a]
+        chunk["ret_b"] = chunk[ticker_b]
+        chunk["diff_ret"] = chunk["ret_a"] - chunk["beta_D"] * chunk["ret_b"]
+        chunk["ind_nyse_rth"] = True
+        chunks.append(chunk)
+
+    if not chunks:
+        return df.iloc[:0].copy()
+
+    out = pd.concat(chunks, ignore_index=True)
     out["cum_diff_ret"] = out.groupby("Trading date", group_keys=False)["diff_ret"].cumsum()
-    return out
+    return out.sort_values("DT").reset_index(drop=True)

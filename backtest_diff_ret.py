@@ -3,7 +3,7 @@
 Backtest: cumulative β_D hedged return spread with scaled exits.
 
 Signal (session cumulative diff_ret from open):
-  diff_ret = r_A − β_D×r_B  (minute)
+  diff_ret = r_A − β_D×r_B  (5-min bar returns by default)
   cum_diff = Σ diff_ret within session
 
 Long when cum_diff >= +entry_pct; short when cum_diff <= −entry_pct.
@@ -55,6 +55,7 @@ class StrategyParams:
     stop_partial_cut: float = 0.50
     stop_full_pct: float = 0.0
     notional: float = 10_000.0
+    return_minutes: int = 5
     one_trade_per_side_per_day: bool = True
 
 
@@ -344,6 +345,7 @@ def summary_stats(daily_df: pd.DataFrame, fills_df: pd.DataFrame, p: StrategyPar
         ("Notional per full leg", p.notional),
         ("Entry threshold (%)", p.entry_pct),
         ("TP levels (%)", f"{p.tp_start_pct}…{p.tp_start_pct + (p.tp_slices - 1) * p.tp_step_pct} step {p.tp_step_pct}"),
+        ("Return bar (min)", p.return_minutes),
         ("Hedge β", "β_D (prior day 15m) in signal & PnL"),
         (
             "Stop loss",
@@ -438,6 +440,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--entry", type=float, default=1.5, help="Entry |cum_diff| threshold (%%)")
     p.add_argument("--tp-start", type=float, default=2.1, help="First TP level for long (%% cum)")
     p.add_argument("--notional", type=float, default=10_000.0)
+    p.add_argument(
+        "--return-minutes",
+        type=int,
+        default=5,
+        help="Bar size for r_A, r_B returns (default: 5)",
+    )
     p.add_argument("--data-folder", default=None)
     p.add_argument("--output", default="diff_ret_backtest.html")
     p.add_argument("--no-browser", action="store_true")
@@ -448,12 +456,22 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     folder = args.data_folder or Paths().min_folder
-    params = StrategyParams(entry_pct=args.entry, tp_start_pct=args.tp_start, notional=args.notional)
+    params = StrategyParams(
+        entry_pct=args.entry,
+        tp_start_pct=args.tp_start,
+        notional=args.notional,
+        return_minutes=args.return_minutes,
+    )
 
     print(f"Loading {args.ticker_a}/{args.ticker_b} …")
     df = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
-    df = attach_diff_ret(df, args.ticker_a, args.ticker_b)
-    print(f"  {df['Trading date'].nunique()} sessions, {len(df):,} minutes")
+    df = attach_diff_ret(
+        df, args.ticker_a, args.ticker_b, return_minutes=params.return_minutes
+    )
+    print(
+        f"  {df['Trading date'].nunique()} sessions, "
+        f"{len(df):,} {params.return_minutes}m bars"
+    )
 
     fills_df, daily_df = run_backtest(df, params)
     summary = summary_stats(daily_df, fills_df, params)
