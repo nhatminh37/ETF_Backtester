@@ -283,6 +283,147 @@ def attach_lookback_beta(
     return df
 
 
+def attach_beta20_price_spread(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    lookback_days: int = 20,
+    lag_sessions: int = 1,
+) -> pd.DataFrame:
+    """
+    Dollar beta-adjusted price spread (not returns).
+
+    Adds columns on ``df``:
+
+    - ``{ticker}-{cmdty}_beta20`` — OLS β from prior ``lookback_days`` daily returns
+    - ``{ticker}-{cmdty}_price_b20`` — ``price_ticker − β₂₀×price_cmdty`` ($)
+    - ``{ticker}-{cmdty}_price_b20_vs_open`` — spread minus session-open spread ($)
+    """
+    spread_col = f"{ticker}-{cmdty}"
+    out = attach_lookback_beta(df, ticker, cmdty, lookback_days, lag_sessions)
+    beta_col = f"{spread_col}_beta20"
+    out[f"{spread_col}_price_b20"] = out[ticker] - out[beta_col] * out[cmdty]
+    session_open = out.groupby("Trading date")[f"{spread_col}_price_b20"].transform("first")
+    out[f"{spread_col}_price_b20_vs_open"] = out[f"{spread_col}_price_b20"] - session_open
+    return out
+
+
+def beta20_price_spread_figure(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    *,
+    trading_date: int | None = None,
+    show_vs_open: bool = True,
+    show_level: bool = True,
+    height: int = 920,
+    width: int = 1500,
+) -> "go.Figure":
+    """
+    Large Plotly chart for β₂₀ dollar price spread (1-min RTH).
+
+    ``show_vs_open``: session spread change from open ($) — usually easiest to read.
+    ``show_level``: raw ``P_A − β₂₀×P_B`` level ($).
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    spread_col = f"{ticker}-{cmdty}"
+    level_col = f"{spread_col}_price_b20"
+    vs_open_col = f"{spread_col}_price_b20_vs_open"
+    beta_col = f"{spread_col}_beta20"
+
+    if level_col not in df.columns:
+        raise ValueError(f"Missing {level_col}; call attach_beta20_price_spread first.")
+
+    sub = df.loc[df["ind_nyse_rth"] == True].copy()
+    if trading_date is not None:
+        sub = sub.loc[sub["Trading date"] == trading_date]
+    sub = sub.dropna(subset=[level_col]).sort_values("DT")
+    if sub.empty:
+        raise ValueError("No RTH rows to plot for the selected window.")
+
+    td_label = (
+        str(int(trading_date))
+        if trading_date is not None
+        else f"{int(sub['Trading date'].min())}–{int(sub['Trading date'].max())}"
+    )
+    beta_val = sub[beta_col].dropna().iloc[0] if sub[beta_col].notna().any() else float("nan")
+    beta_txt = f"{beta_val:.3f}" if pd.notna(beta_val) else "n/a"
+
+    rows = int(show_vs_open) + int(show_level)
+    if rows == 0:
+        show_vs_open = True
+        rows = 1
+
+    titles: list[str] = []
+    if show_vs_open:
+        titles.append(f"Δ spread from open ($) — {ticker} − β₂₀×{cmdty}")
+    if show_level:
+        titles.append(f"Spread level ($) — {ticker} − β₂₀×{cmdty}")
+
+    fig = make_subplots(
+        rows=rows,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        subplot_titles=titles,
+    )
+
+    row = 1
+    if show_vs_open:
+        fig.add_trace(
+            go.Scatter(
+                x=sub["DT"],
+                y=sub[vs_open_col],
+                mode="lines",
+                name="vs open ($)",
+                line=dict(width=2.8, color="#1f77b4"),
+            ),
+            row=row,
+            col=1,
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color="#999", line_width=1.5, row=row, col=1)
+        row += 1
+
+    if show_level:
+        fig.add_trace(
+            go.Scatter(
+                x=sub["DT"],
+                y=sub[level_col],
+                mode="lines",
+                name="level ($)",
+                line=dict(width=2.8, color="#d62728"),
+            ),
+            row=row,
+            col=1,
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"β₂₀ price spread — {ticker} vs {cmdty} "
+                f"({td_label}, β₂₀={beta_txt})"
+            ),
+            font=dict(size=22),
+        ),
+        template="plotly_white",
+        height=height,
+        width=width,
+        font=dict(size=16),
+        legend=dict(font=dict(size=14)),
+        margin=dict(l=70, r=40, t=90, b=60),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(title_text="Time (ET)", title_font=dict(size=16), tickfont=dict(size=13))
+    fig.update_yaxes(title_font=dict(size=16), tickfont=dict(size=13))
+    if show_vs_open:
+        fig.update_yaxes(title_text="Δ spread from open ($)", row=1, col=1)
+    if show_level:
+        fig.update_yaxes(title_text="Spread level ($)", row=rows, col=1)
+    return fig
+
+
 def forward_beta_hedged_return(
     df: pd.DataFrame,
     ticker: str,
