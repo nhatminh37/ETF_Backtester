@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=None)
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--level-only", action="store_true", help="Only raw spread level panel")
-    p.add_argument("--vs-open-only", action="store_true", help="Only vs-open panel")
+    p.add_argument("--vs-945-only", action="store_true", help="Only vs-9:45 panel")
     p.add_argument("--height", type=int, default=920)
     p.add_argument("--width", type=int, default=1500)
     return p.parse_args()
@@ -81,8 +81,8 @@ def main() -> None:
         trading_date = None
         print(f"  mode=range, plotting {args.start}–{args.end}")
 
-    show_vs_open = not args.level_only
-    show_level = not args.vs_open_only
+    show_vs_anchor = not args.level_only
+    show_level = not args.vs_945_only
     height = args.height if mode == "day" else max(args.height, 1000)
 
     fig = beta20_price_spread_figure(
@@ -90,7 +90,7 @@ def main() -> None:
         args.ticker_a,
         args.ticker_b,
         trading_date=trading_date,
-        show_vs_open=show_vs_open,
+        show_vs_anchor=show_vs_anchor,
         show_level=show_level,
         height=height,
         width=args.width,

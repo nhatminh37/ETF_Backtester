@@ -283,12 +283,42 @@ def attach_lookback_beta(
     return df
 
 
+def _spread_vs_session_anchor(
+    group: pd.DataFrame,
+    level_col: str,
+    anchor_hour: int,
+    anchor_minute: int,
+) -> pd.Series:
+    """Spread minus spread at ``anchor_hour:anchor_minute`` ET; NaN before anchor."""
+    g = group.sort_values("DT")
+    mask = (g["DT"].dt.hour == anchor_hour) & (g["DT"].dt.minute == anchor_minute)
+    anchor_rows = g.loc[mask, level_col]
+    if anchor_rows.empty:
+        t_anchor = g["DT"].iloc[0].normalize() + pd.Timedelta(
+            hours=anchor_hour, minutes=anchor_minute
+        )
+        fallback = g.loc[g["DT"] >= t_anchor]
+        if fallback.empty:
+            return pd.Series(np.nan, index=g.index)
+        anchor_val = float(fallback[level_col].iloc[0])
+        anchor_dt = fallback["DT"].iloc[0]
+    else:
+        anchor_val = float(anchor_rows.iloc[0])
+        anchor_dt = g.loc[mask, "DT"].iloc[0]
+
+    out = g[level_col] - anchor_val
+    out = out.where(g["DT"] >= anchor_dt)
+    return out.reindex(group.index)
+
+
 def attach_beta20_price_spread(
     df: pd.DataFrame,
     ticker: str,
     cmdty: str,
     lookback_days: int = 20,
     lag_sessions: int = 1,
+    anchor_hour: int = 9,
+    anchor_minute: int = 45,
 ) -> pd.DataFrame:
     """
     Dollar beta-adjusted price spread (not returns).
@@ -297,15 +327,23 @@ def attach_beta20_price_spread(
 
     - ``{ticker}-{cmdty}_beta20`` — OLS β from prior ``lookback_days`` daily returns
     - ``{ticker}-{cmdty}_price_b20`` — ``price_ticker − β₂₀×price_cmdty`` ($)
-    - ``{ticker}-{cmdty}_price_b20_vs_open`` — spread minus session-open spread ($)
+    - ``{ticker}-{cmdty}_price_b20_vs_945`` — spread minus spread at 9:45 ET ($);
+      NaN before 9:45 each session (RTH open is 9:30).
     """
     spread_col = f"{ticker}-{cmdty}"
     out = attach_lookback_beta(df, ticker, cmdty, lookback_days, lag_sessions)
     beta_col = f"{spread_col}_beta20"
-    out[f"{spread_col}_price_b20"] = out[ticker] - out[beta_col] * out[cmdty]
-    session_open = out.groupby("Trading date")[f"{spread_col}_price_b20"].transform("first")
-    out[f"{spread_col}_price_b20_vs_open"] = out[f"{spread_col}_price_b20"] - session_open
-    return out
+    level_col = f"{spread_col}_price_b20"
+    vs_col = f"{spread_col}_price_b20_vs_945"
+    out[level_col] = out[ticker] - out[beta_col] * out[cmdty]
+    parts: list[pd.DataFrame] = []
+    for _, g in out.groupby("Trading date", sort=False):
+        chunk = g.copy()
+        chunk[vs_col] = _spread_vs_session_anchor(
+            chunk, level_col, anchor_hour, anchor_minute
+        )
+        parts.append(chunk)
+    return pd.concat(parts).sort_values("DT").reset_index(drop=True)
 
 
 def beta20_price_spread_figure(
@@ -314,8 +352,9 @@ def beta20_price_spread_figure(
     cmdty: str,
     *,
     trading_date: int | None = None,
-    show_vs_open: bool = True,
+    show_vs_anchor: bool = True,
     show_level: bool = True,
+    anchor_label: str = "9:45",
     height: int = 920,
     width: int = 1500,
     line_width: float | None = None,
@@ -325,7 +364,7 @@ def beta20_price_spread_figure(
 
     Pass ``trading_date=None`` to plot every session between the dates in ``df``.
 
-    ``show_vs_open``: session spread change from open ($) — usually easiest to read.
+    ``show_vs_anchor``: spread change from 9:45 anchor ($) — 0 at 9:45 each session.
     ``show_level``: raw ``P_A − β₂₀×P_B`` level ($).
     """
     import plotly.graph_objects as go
@@ -333,7 +372,7 @@ def beta20_price_spread_figure(
 
     spread_col = f"{ticker}-{cmdty}"
     level_col = f"{spread_col}_price_b20"
-    vs_open_col = f"{spread_col}_price_b20_vs_open"
+    vs_col = f"{spread_col}_price_b20_vs_945"
     beta_col = f"{spread_col}_beta20"
 
     if level_col not in df.columns:
@@ -361,14 +400,14 @@ def beta20_price_spread_figure(
     if line_width is None:
         line_width = 2.8 if n_sessions <= 2 else (1.2 if n_sessions <= 30 else 0.6)
 
-    rows = int(show_vs_open) + int(show_level)
+    rows = int(show_vs_anchor) + int(show_level)
     if rows == 0:
-        show_vs_open = True
+        show_vs_anchor = True
         rows = 1
 
     titles: list[str] = []
-    if show_vs_open:
-        titles.append(f"Δ spread from open ($) — {ticker} − β₂₀×{cmdty}")
+    if show_vs_anchor:
+        titles.append(f"Δ spread from {anchor_label} ($) — {ticker} − β₂₀×{cmdty}")
     if show_level:
         titles.append(f"Spread level ($) — {ticker} − β₂₀×{cmdty}")
 
@@ -381,13 +420,13 @@ def beta20_price_spread_figure(
     )
 
     row = 1
-    if show_vs_open:
+    if show_vs_anchor:
         fig.add_trace(
             go.Scatter(
                 x=sub["DT"],
-                y=sub[vs_open_col],
+                y=sub[vs_col],
                 mode="lines",
-                name="vs open ($)",
+                name=f"vs {anchor_label} ($)",
                 line=dict(width=line_width, color="#1f77b4"),
             ),
             row=row,
@@ -427,8 +466,8 @@ def beta20_price_spread_figure(
     )
     fig.update_xaxes(title_text="Time (ET)", title_font=dict(size=16), tickfont=dict(size=13))
     fig.update_yaxes(title_font=dict(size=16), tickfont=dict(size=13))
-    if show_vs_open:
-        fig.update_yaxes(title_text="Δ spread from open ($)", row=1, col=1)
+    if show_vs_anchor:
+        fig.update_yaxes(title_text=f"Δ spread from {anchor_label} ($)", row=1, col=1)
     if show_level:
         fig.update_yaxes(title_text="Spread level ($)", row=rows, col=1)
     return fig
