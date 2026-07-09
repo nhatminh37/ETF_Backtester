@@ -9,9 +9,11 @@ Plots minute-level RTH **return spreads** for a pair (A, B):
   3. r_A − β₁₀×r_B
   4. r_A − β₂₀×r_B
   5. r_A − β_D×r_B   (β from prior session 15-min returns: 9:45, 10:00, …)
+  6. r_A − β_adapted×r_B (rolling 30-min OLS; available after first 30 min RTH)
 
 Charts show the **cumulative session return spread** (cumsum from open, resets each day).
 Use ``--return-view minute`` for raw 1-min return spreads instead.
+Use ``--only-adapted`` to plot only the rolling-β spread.
 
 Usage::
 
@@ -35,6 +37,7 @@ from plotly.subplots import make_subplots
 from silver_backtesting.config import Paths
 from silver_backtesting.loaders import market_calendar
 from silver_backtesting.spread import (
+    add_rolling_adapted_spread_columns,
     lookback_beta_by_trading_date,
     ols_beta,
     pair_15min_returns,
@@ -47,6 +50,11 @@ SPREAD_SPECS: list[tuple[str, str]] = [
     ("r_A − β₁₀×r_B", "spread_b10"),
     ("r_A − β₂₀×r_B", "spread_b20"),
     ("r_A − β_D×r_B (prior day 15m)", "spread_bD"),
+    ("r_A − β_adapted×r_B (roll 30m)", "spread_bAdapted"),
+]
+
+ADAPTED_SPEC: list[tuple[str, str]] = [
+    ("r_A − β_adapted×r_B (roll 30m)", "spread_bAdapted"),
 ]
 
 
@@ -83,6 +91,23 @@ def _parse_args() -> argparse.Namespace:
         "--data-folder",
         default=None,
         help="Minute CSV folder (default: Paths().min_folder)",
+    )
+    p.add_argument(
+        "--only-adapted",
+        action="store_true",
+        help="Plot only r_A − β_adapted×r_B (rolling session beta).",
+    )
+    p.add_argument(
+        "--beta-window",
+        type=int,
+        default=30,
+        help="Rolling window (minutes) for β_adapted OLS (default: 30).",
+    )
+    p.add_argument(
+        "--beta-warmup",
+        type=int,
+        default=30,
+        help="Minutes after open before β_adapted / spread are available (default: 30).",
     )
     p.add_argument("--output", default=None, help="Write HTML here instead of a temp file")
     p.add_argument("--no-browser", action="store_true", help="Do not open the chart in a browser")
@@ -209,8 +234,10 @@ def attach_spread_columns(
     df: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
+    beta_window: int = 30,
+    beta_warmup: int = 30,
 ) -> pd.DataFrame:
-    """Add beta columns and five minute return spreads (r_A − β×r_B)."""
+    """Add beta columns and minute return spreads (r_A − β×r_B)."""
     out = _attach_minute_returns(df, ticker_a, ticker_b)
     beta5 = lookback_beta_by_trading_date(
         out, ticker_a, ticker_b, lookback_days=5, lag_sessions=1
@@ -234,12 +261,20 @@ def attach_spread_columns(
     out["spread_b10"] = ra - out["beta10"] * rb
     out["spread_b20"] = ra - out["beta20"] * rb
     out["spread_bD"] = ra - out["beta_D"] * rb
+
+    out = add_rolling_adapted_spread_columns(
+        out, window_minutes=beta_window, warmup_minutes=beta_warmup
+    )
     return out
 
 
-def plot_spread_columns(df: pd.DataFrame, return_view: str) -> pd.DataFrame:
+def plot_spread_columns(
+    df: pd.DataFrame,
+    return_view: str,
+    specs: list[tuple[str, str]],
+) -> pd.DataFrame:
     """Return columns to plot (cumulative session path or raw minute spreads)."""
-    cols = [col for _, col in SPREAD_SPECS]
+    cols = [col for _, col in specs]
     if return_view == "minute":
         return df
     out = df.copy()
@@ -249,13 +284,17 @@ def plot_spread_columns(df: pd.DataFrame, return_view: str) -> pd.DataFrame:
 
 
 def _beta_summary_row(df: pd.DataFrame, td: int) -> pd.Series:
-    day = df.loc[df["Trading date"] == td].iloc[0]
+    day = df.loc[df["Trading date"] == td]
+    last_adapted = day["beta_adapted"].dropna()
+    adapted_end = last_adapted.iloc[-1] if not last_adapted.empty else float("nan")
+    first = day.iloc[0]
     return pd.Series(
         {
-            "beta5": day["beta5"],
-            "beta10": day["beta10"],
-            "beta20": day["beta20"],
-            "beta_D (prior 15m day)": day["beta_D"],
+            "beta5": first["beta5"],
+            "beta10": first["beta10"],
+            "beta20": first["beta20"],
+            "beta_D (prior 15m day)": first["beta_D"],
+            "beta_adapted (EOD)": adapted_end,
         }
     )
 
@@ -271,14 +310,15 @@ def figure_intraday_day(
     td: int,
     ticker_a: str,
     ticker_b: str,
+    specs: list[tuple[str, str]],
     return_view: str = "cumulative",
 ) -> go.Figure:
-    """All five spreads overlaid for one session."""
+    """Spread overlays for one session."""
     sub = df.loc[df["Trading date"] == td].sort_values("DT")
     fig = go.Figure()
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
-    for (label, col), color in zip(SPREAD_SPECS, colors):
+    for (label, col), color in zip(specs, colors):
         fig.add_trace(
             go.Scatter(
                 x=sub["DT"],
@@ -310,19 +350,21 @@ def figure_range(
     df: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
+    specs: list[tuple[str, str]],
     return_view: str = "cumulative",
 ) -> go.Figure:
-    """Five stacked subplots for the full date window."""
+    """Stacked subplots for the full date window."""
+    n = len(specs)
     fig = make_subplots(
-        rows=5,
+        rows=n,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
-        subplot_titles=[label for label, _ in SPREAD_SPECS],
+        subplot_titles=[label for label, _ in specs],
     )
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
-    for i, ((label, col), color) in enumerate(zip(SPREAD_SPECS, colors), start=1):
+    for i, ((label, col), color) in enumerate(zip(specs, colors), start=1):
         fig.add_trace(
             go.Scatter(
                 x=df["DT"],
@@ -344,9 +386,9 @@ def figure_range(
             f"({df['Trading date'].min()}–{df['Trading date'].max()}, {view_note})"
         ),
         template="plotly_white",
-        height=900,
+        height=max(700, 170 * n),
     )
-    fig.update_xaxes(title_text="Time (ET)", row=5, col=1)
+    fig.update_xaxes(title_text="Time (ET)", row=n, col=1)
     fig.update_yaxes(title_text=_yaxis_title(return_view))
     return fig
 
@@ -360,22 +402,33 @@ def main() -> None:
     df = load_pair_panel(ticker_a, ticker_b, folder, args.start, args.end)
     print(f"  {len(df):,} RTH minutes ({df['Trading date'].nunique()} sessions)")
 
-    df = attach_spread_columns(df, ticker_a, ticker_b)
-    plot_df = plot_spread_columns(df, args.return_view)
+    df = attach_spread_columns(
+        df,
+        ticker_a,
+        ticker_b,
+        beta_window=args.beta_window,
+        beta_warmup=args.beta_warmup,
+    )
+    specs = ADAPTED_SPEC if args.only_adapted else SPREAD_SPECS
+    plot_df = plot_spread_columns(df, args.return_view, specs)
 
     focus_td = args.date or int(df["Trading date"].max())
     if focus_td not in set(df["Trading date"].astype(int)):
         raise SystemExit(f"No data for --date {focus_td} in loaded window.")
 
-    print(f"\nBetas used on {focus_td} (fixed for whole session):")
+    print(f"\nBetas on {focus_td}:")
     print(_beta_summary_row(df, focus_td).to_string())
+    if args.only_adapted:
+        sub = df.loc[df["Trading date"] == focus_td]
+        first = sub.loc[sub["beta_adapted"].notna(), "DT"].min()
+        print(f"  β_adapted first available: {first} (after {args.beta_warmup} min warmup)")
 
     if args.mode == "day":
         fig = figure_intraday_day(
-            plot_df, focus_td, ticker_a, ticker_b, args.return_view
+            plot_df, focus_td, ticker_a, ticker_b, specs, args.return_view
         )
     else:
-        fig = figure_range(plot_df, ticker_a, ticker_b, args.return_view)
+        fig = figure_range(plot_df, ticker_a, ticker_b, specs, args.return_view)
 
     if args.output:
         out_path = args.output

@@ -121,6 +121,64 @@ def ols_beta(stock_ret: pd.Series, bench_ret: pd.Series) -> float:
     return float(aligned["s"].cov(aligned["b"]) / var_b)
 
 
+def _rolling_beta_on_window(ra: pd.Series, rb: pd.Series) -> float:
+    return ols_beta(ra, rb)
+
+
+def add_rolling_adapted_spread_columns(
+    df: pd.DataFrame,
+    window_minutes: int = 30,
+    warmup_minutes: int = 30,
+) -> pd.DataFrame:
+    """Add ``beta_adapted`` and ``spread_bAdapted``; requires ``ret_a`` and ``ret_b``."""
+    if "ret_a" not in df.columns or "ret_b" not in df.columns:
+        raise ValueError("add_rolling_adapted_spread_columns needs ret_a and ret_b")
+
+    chunks: list[pd.DataFrame] = []
+    for _, grp in df.groupby("Trading date", sort=False):
+        g = grp.sort_values("DT").copy()
+        ra = g["ret_a"].to_numpy()
+        rb = g["ret_b"].to_numpy()
+        session_start = g["DT"].iloc[0]
+        elapsed = (g["DT"] - session_start).dt.total_seconds().to_numpy() / 60.0
+        betas = np.full(len(g), np.nan)
+
+        for i in range(len(g)):
+            if elapsed[i] < warmup_minutes:
+                continue
+            start = max(0, i - window_minutes + 1)
+            betas[i] = _rolling_beta_on_window(
+                pd.Series(ra[start : i + 1]),
+                pd.Series(rb[start : i + 1]),
+            )
+
+        g["beta_adapted"] = betas
+        g["spread_bAdapted"] = g["ret_a"] - g["beta_adapted"] * g["ret_b"]
+        chunks.append(g)
+
+    return pd.concat(chunks).sort_values("DT").reset_index(drop=True)
+
+
+def attach_adapted_beta_spread(
+    df: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    window_minutes: int = 30,
+    warmup_minutes: int = 30,
+) -> pd.DataFrame:
+    """
+    Rolling OLS β on 1-min returns within each session.
+
+    ``beta_adapted`` and ``spread_bAdapted`` (= r_A − β_adapted×r_B) are NaN until
+    ``warmup_minutes`` have elapsed since the session open (default: first value at 10:00 ET).
+    """
+    out = df.copy()
+    valid = out.groupby("Trading date")["DT"].diff().eq(pd.Timedelta(minutes=1))
+    out["ret_a"] = out.groupby("Trading date")[ticker_a].pct_change().where(valid)
+    out["ret_b"] = out.groupby("Trading date")[ticker_b].pct_change().where(valid)
+    return add_rolling_adapted_spread_columns(out, window_minutes, warmup_minutes)
+
+
 def pair_daily_returns(
     df: pd.DataFrame,
     ticker: str,
