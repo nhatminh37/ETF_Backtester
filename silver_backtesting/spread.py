@@ -311,30 +311,42 @@ def _spread_vs_session_anchor(
     return out.reindex(group.index)
 
 
-def attach_beta20_price_spread(
+def prior_session_15m_beta_by_date(
     df: pd.DataFrame,
     ticker: str,
     cmdty: str,
-    lookback_days: int = 20,
-    lag_sessions: int = 1,
+    bar_minutes: int = 15,
+) -> pd.Series:
+    """For session *t*, OLS β from all 15-min returns on prior session."""
+    fifteen = pair_15min_returns(df, ticker, cmdty, bar_minutes)
+    if fifteen is None or fifteen.empty:
+        return pd.Series(dtype=float)
+
+    by_session: dict[int, float] = {}
+    for td, day in fifteen.groupby("Trading date"):
+        by_session[int(td)] = ols_beta(day[ticker], day[cmdty])
+
+    dates = sorted(by_session)
+    lagged: dict[int, float] = {}
+    for i in range(1, len(dates)):
+        lagged[dates[i]] = by_session[dates[i - 1]]
+    return pd.Series(lagged, name="beta_D")
+
+
+def _attach_beta_price_spread(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    beta_by_date: pd.Series,
+    *,
+    beta_col: str,
+    level_col: str,
+    vs_col: str,
     anchor_hour: int = 9,
     anchor_minute: int = 45,
 ) -> pd.DataFrame:
-    """
-    Dollar beta-adjusted price spread (not returns).
-
-    Adds columns on ``df``:
-
-    - ``{ticker}-{cmdty}_beta20`` — OLS β from prior ``lookback_days`` daily returns
-    - ``{ticker}-{cmdty}_price_b20`` — ``price_ticker − β₂₀×price_cmdty`` ($)
-    - ``{ticker}-{cmdty}_price_b20_vs_945`` — spread minus spread at 9:45 ET ($);
-      NaN before 9:45 each session (RTH open is 9:30).
-    """
-    spread_col = f"{ticker}-{cmdty}"
-    out = attach_lookback_beta(df, ticker, cmdty, lookback_days, lag_sessions)
-    beta_col = f"{spread_col}_beta20"
-    level_col = f"{spread_col}_price_b20"
-    vs_col = f"{spread_col}_price_b20_vs_945"
+    out = df.copy()
+    out[beta_col] = out["Trading date"].map(beta_by_date)
     out[level_col] = out[ticker] - out[beta_col] * out[cmdty]
     parts: list[pd.DataFrame] = []
     for _, g in out.groupby("Trading date", sort=False):
@@ -346,11 +358,72 @@ def attach_beta20_price_spread(
     return pd.concat(parts).sort_values("DT").reset_index(drop=True)
 
 
-def beta20_price_spread_figure(
+def attach_beta20_price_spread(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    lookback_days: int = 20,
+    lag_sessions: int = 1,
+    anchor_hour: int = 9,
+    anchor_minute: int = 45,
+) -> pd.DataFrame:
+    """
+    Dollar β₂₀ price spread (not returns).
+
+    Adds ``{spread}_beta20``, ``{spread}_price_b20``, ``{spread}_price_b20_vs_945``.
+    """
+    spread_col = f"{ticker}-{cmdty}"
+    beta_by_date = lookback_beta_by_trading_date(
+        df, ticker, cmdty, lookback_days=lookback_days, lag_sessions=lag_sessions
+    )
+    return _attach_beta_price_spread(
+        df,
+        ticker,
+        cmdty,
+        beta_by_date,
+        beta_col=f"{spread_col}_beta20",
+        level_col=f"{spread_col}_price_b20",
+        vs_col=f"{spread_col}_price_b20_vs_945",
+        anchor_hour=anchor_hour,
+        anchor_minute=anchor_minute,
+    )
+
+
+def attach_beta_d_price_spread(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    anchor_hour: int = 9,
+    anchor_minute: int = 45,
+    bar_minutes: int = 15,
+) -> pd.DataFrame:
+    """
+    Dollar β_D price spread (not returns).
+
+    β_D = OLS on **prior session** 15-min returns. Adds ``{spread}_beta_D``,
+    ``{spread}_price_bD``, ``{spread}_price_bD_vs_945``.
+    """
+    spread_col = f"{ticker}-{cmdty}"
+    beta_by_date = prior_session_15m_beta_by_date(df, ticker, cmdty, bar_minutes)
+    return _attach_beta_price_spread(
+        df,
+        ticker,
+        cmdty,
+        beta_by_date,
+        beta_col=f"{spread_col}_beta_D",
+        level_col=f"{spread_col}_price_bD",
+        vs_col=f"{spread_col}_price_bD_vs_945",
+        anchor_hour=anchor_hour,
+        anchor_minute=anchor_minute,
+    )
+
+
+def beta_price_spread_figure(
     df: pd.DataFrame,
     ticker: str,
     cmdty: str,
     *,
+    beta: str = "20",
     trading_date: int | None = None,
     show_vs_anchor: bool = True,
     show_level: bool = True,
@@ -360,23 +433,39 @@ def beta20_price_spread_figure(
     line_width: float | None = None,
 ) -> "go.Figure":
     """
-    Large Plotly chart for β₂₀ dollar price spread (1-min RTH).
+    Large Plotly chart for β dollar price spread (1-min RTH).
 
-    Pass ``trading_date=None`` to plot every session between the dates in ``df``.
-
-    ``show_vs_anchor``: spread change from 9:45 anchor ($) — 0 at 9:45 each session.
-    ``show_level``: raw ``P_A − β₂₀×P_B`` level ($).
+    ``beta``: ``"20"`` (20-day daily) or ``"D"`` (prior session 15m).
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     spread_col = f"{ticker}-{cmdty}"
-    level_col = f"{spread_col}_price_b20"
-    vs_col = f"{spread_col}_price_b20_vs_945"
-    beta_col = f"{spread_col}_beta20"
+    specs = {
+        "20": {
+            "beta_col": f"{spread_col}_beta20",
+            "level_col": f"{spread_col}_price_b20",
+            "vs_col": f"{spread_col}_price_b20_vs_945",
+            "label": "β₂₀",
+        },
+        "D": {
+            "beta_col": f"{spread_col}_beta_D",
+            "level_col": f"{spread_col}_price_bD",
+            "vs_col": f"{spread_col}_price_bD_vs_945",
+            "label": "β_D",
+        },
+    }
+    if beta not in specs:
+        raise ValueError(f"beta must be '20' or 'D', got {beta!r}")
+    cfg = specs[beta]
+    level_col = cfg["level_col"]
+    vs_col = cfg["vs_col"]
+    beta_col = cfg["beta_col"]
+    beta_label = cfg["label"]
 
     if level_col not in df.columns:
-        raise ValueError(f"Missing {level_col}; call attach_beta20_price_spread first.")
+        fn = "attach_beta20_price_spread" if beta == "20" else "attach_beta_d_price_spread"
+        raise ValueError(f"Missing {level_col}; call {fn} first.")
 
     sub = df.loc[df["ind_nyse_rth"] == True].copy()
     if trading_date is not None:
@@ -395,7 +484,7 @@ def beta20_price_spread_figure(
         beta_val = sub[beta_col].dropna().iloc[0] if sub[beta_col].notna().any() else float("nan")
         beta_txt = f"{beta_val:.3f}" if pd.notna(beta_val) else "n/a"
     else:
-        beta_txt = f"{n_sessions} sessions (β₂₀ fixed per day)"
+        beta_txt = f"{n_sessions} sessions ({beta_label} fixed per day)"
 
     if line_width is None:
         line_width = 2.8 if n_sessions <= 2 else (1.2 if n_sessions <= 30 else 0.6)
@@ -407,9 +496,9 @@ def beta20_price_spread_figure(
 
     titles: list[str] = []
     if show_vs_anchor:
-        titles.append(f"Δ spread from {anchor_label} ($) — {ticker} − β₂₀×{cmdty}")
+        titles.append(f"Δ spread from {anchor_label} ($) — {ticker} − {beta_label}×{cmdty}")
     if show_level:
-        titles.append(f"Spread level ($) — {ticker} − β₂₀×{cmdty}")
+        titles.append(f"Spread level ($) — {ticker} − {beta_label}×{cmdty}")
 
     fig = make_subplots(
         rows=rows,
@@ -450,10 +539,7 @@ def beta20_price_spread_figure(
 
     fig.update_layout(
         title=dict(
-            text=(
-                f"β₂₀ price spread — {ticker} vs {cmdty} "
-                f"({td_label}, β₂₀={beta_txt})"
-            ),
+            text=f"{beta_label} price spread — {ticker} vs {cmdty} ({td_label}, {beta_label}={beta_txt})",
             font=dict(size=22),
         ),
         template="plotly_white",
@@ -471,6 +557,16 @@ def beta20_price_spread_figure(
     if show_level:
         fig.update_yaxes(title_text="Spread level ($)", row=rows, col=1)
     return fig
+
+
+def beta20_price_spread_figure(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    **kwargs,
+) -> "go.Figure":
+    """Backward-compatible wrapper for ``beta_price_spread_figure(..., beta='20')``."""
+    return beta_price_spread_figure(df, ticker, cmdty, beta="20", **kwargs)
 
 
 def forward_beta_hedged_return(

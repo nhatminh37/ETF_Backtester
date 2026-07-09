@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Plot β₂₀ **dollar price spread** (not return): price_A − β₂₀×price_B.
+Plot **dollar price spread** (not return): price_A − β×price_B.
 
 Large charts for readability. Uses helpers in ``silver_backtesting.spread``.
 
 Usage::
 
-    # Full year (all RTH minutes in range):
-    python plot_price_spread.py --start 20250101 --end 20251231 --mode range
+    # Full year with β_D (same hedge as backtest):
+    python plot_price_spread.py --start 20250101 --end 20251231 --mode range --beta D
+
+    # β₂₀ (20-day daily lookback):
+    python plot_price_spread.py --start 20250101 --end 20251231 --mode range --beta 20
 
     # Single session:
-    python plot_price_spread.py --start 20250101 --end 20251231 --date 20250910 --mode day
+    python plot_price_spread.py --start 20250101 --end 20251231 --date 20250910 --mode day --beta D
 """
 
 from __future__ import annotations
@@ -23,7 +26,11 @@ from datetime import datetime, timedelta
 
 from silver_backtesting.config import Paths
 from silver_backtesting.pair_quick import load_pair_panel
-from silver_backtesting.spread import attach_beta20_price_spread, beta20_price_spread_figure
+from silver_backtesting.spread import (
+    attach_beta20_price_spread,
+    attach_beta_d_price_spread,
+    beta_price_spread_figure,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -31,7 +38,9 @@ def _parse_args() -> argparse.Namespace:
     default_end = int(today.strftime("%Y%m%d"))
     default_start = int((today - timedelta(days=45)).strftime("%Y%m%d"))
 
-    p = argparse.ArgumentParser(description="Plot β₂₀ dollar price spread (large figure).")
+    p = argparse.ArgumentParser(
+        description="Plot dollar price spread (β₂₀ or β_D hedge, large figure)."
+    )
     p.add_argument("--ticker-a", default="PAAS")
     p.add_argument("--ticker-b", default="SLV")
     p.add_argument("--start", type=int, default=default_start)
@@ -44,7 +53,13 @@ def _parse_args() -> argparse.Namespace:
         help="'range' = all sessions in start–end (default if --date omitted); "
         "'day' = one session (--date or last day in range)",
     )
-    p.add_argument("--beta-lookback", type=int, default=20)
+    p.add_argument(
+        "--beta",
+        choices=("20", "D"),
+        default="20",
+        help="Hedge: '20' = 20-day daily OLS; 'D' = prior session 15m OLS (backtest β_D)",
+    )
+    p.add_argument("--beta-lookback", type=int, default=20, help="Days for --beta 20 only")
     p.add_argument("--data-folder", default=None)
     p.add_argument("--output", default=None)
     p.add_argument("--no-browser", action="store_true")
@@ -59,15 +74,19 @@ def main() -> None:
     args = _parse_args()
     folder = args.data_folder or Paths().min_folder
     mode = args.mode or ("day" if args.date is not None else "range")
+    beta_label = "β_D" if args.beta == "D" else "β₂₀"
 
-    print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}) …")
+    print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}), {beta_label} …")
     panel = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
-    df = attach_beta20_price_spread(
-        panel,
-        args.ticker_a,
-        args.ticker_b,
-        lookback_days=args.beta_lookback,
-    )
+    if args.beta == "D":
+        df = attach_beta_d_price_spread(panel, args.ticker_a, args.ticker_b)
+    else:
+        df = attach_beta20_price_spread(
+            panel,
+            args.ticker_a,
+            args.ticker_b,
+            lookback_days=args.beta_lookback,
+        )
     n_sessions = df["Trading date"].nunique()
     print(f"  {n_sessions} sessions, {len(df):,} 1-min bars")
 
@@ -85,10 +104,11 @@ def main() -> None:
     show_level = not args.vs_945_only
     height = args.height if mode == "day" else max(args.height, 1000)
 
-    fig = beta20_price_spread_figure(
+    fig = beta_price_spread_figure(
         df,
         args.ticker_a,
         args.ticker_b,
+        beta=args.beta,
         trading_date=trading_date,
         show_vs_anchor=show_vs_anchor,
         show_level=show_level,
