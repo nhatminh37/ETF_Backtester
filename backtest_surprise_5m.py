@@ -17,7 +17,7 @@ Exit:
   • Take profit when position PnL ≥ +tp_pct on $10k leg, or
   • EOD (last RTH bar) if < 15 min remain in session
 
-$10k notional on **each** leg (PAAS and SLV).
+$10k notional on PAAS; SLV leg sized **$10k × β₂₀** (beta-hedged book).
 
 Usage::
 
@@ -64,13 +64,15 @@ def _leg_breakdown_pair(
     beta_20: float,
 ) -> dict:
     """
-    Equal $notional on PAAS and SLV.
+    β-hedged sizing: $notional on PAAS, $notional×β₂₀ on SLV.
 
     side ``short_a_long_b``: short PAAS, long SLV (fade rich PAAS).
     side ``long_a_short_b``: long PAAS, short SLV (fade cheap PAAS).
     """
-    sh_a = notional / price_a_entry if price_a_entry else 0.0
-    sh_b = notional / price_b_entry if price_b_entry else 0.0
+    n_a = notional
+    n_b = notional * beta_20
+    sh_a = n_a / price_a_entry if price_a_entry else 0.0
+    sh_b = n_b / price_b_entry if price_b_entry else 0.0
 
     if side == "short_a_long_b":
         entry_a, entry_b = "SELL", "BUY"
@@ -89,7 +91,7 @@ def _leg_breakdown_pair(
                 "Leg": "A",
                 "Action": entry_a,
                 "Price": round(price_a_entry, 4),
-                "Notional_usd": round(notional, 2),
+                "Notional_usd": round(n_a, 2),
                 "Shares": round(sh_a, 4),
             },
             {
@@ -97,7 +99,7 @@ def _leg_breakdown_pair(
                 "Action": entry_b,
                 "Price": round(price_b_entry, 4),
                 "Beta_20": round(beta_20, 4),
-                "Notional_usd": round(notional, 2),
+                "Notional_usd": round(n_b, 2),
                 "Shares": round(sh_b, 4),
             },
         ],
@@ -213,8 +215,16 @@ def build_5m_surprise_bars(
     return pd.DataFrame(rows).sort_values(["Trading date", "DT"]).reset_index(drop=True)
 
 
-def _position_pnl_pct(side: str, notional: float, entry_a, entry_b, exit_a, exit_b) -> float:
-    legs = _leg_breakdown_pair(side, notional, entry_a, entry_b, exit_a, exit_b, 0.0)
+def _position_pnl_pct(
+    side: str,
+    notional: float,
+    beta_20: float,
+    entry_a: float,
+    entry_b: float,
+    exit_a: float,
+    exit_b: float,
+) -> float:
+    legs = _leg_breakdown_pair(side, notional, entry_a, entry_b, exit_a, exit_b, beta_20)
     return 100.0 * legs["PnL_total_usd"] / notional if notional else 0.0
 
 
@@ -242,6 +252,7 @@ def simulate_session(
             pnl_pct = _position_pnl_pct(
                 pos["side"],
                 p.notional,
+                float(pos["beta_20"]),
                 pos["entry_a"],
                 pos["entry_b"],
                 pa,
@@ -322,7 +333,13 @@ def simulate_session(
         pa = float(last_row["price_a"])
         pb = float(last_row["price_b"])
         pnl_pct = _position_pnl_pct(
-            pos["side"], p.notional, pos["entry_a"], pos["entry_b"], pa, pb
+            pos["side"],
+            p.notional,
+            float(pos["beta_20"]),
+            pos["entry_a"],
+            pos["entry_b"],
+            pa,
+            pb,
         ) / 100.0
         beta_e = float(pos["beta_20"])
         legs = _leg_breakdown_pair(
@@ -415,7 +432,8 @@ def summary_stats(
         ("β₂₀ lookback", p.beta_lookback),
         ("Hold (min)", p.hold_minutes),
         ("Take profit (%)", p.tp_pct),
-        ("Notional per leg", p.notional),
+        ("Notional leg A", p.notional),
+        ("Hedge leg B", f"${p.notional:,.0f} × β₂₀"),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
@@ -553,7 +571,7 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 <div id="explainer">
   surprise = r_{ticker_a}(since prior close) − β₂₀×r_{ticker_b}(since prior close) on {BAR_MINUTES}m bars.<br>
   surprise &gt; +{p.threshold_pct}% → Short {ticker_a}, Long {ticker_b}. &lt; −{p.threshold_pct}% → opposite.<br>
-  Exit: {p.hold_minutes}m, TP {p.tp_pct}%, or EOD. ${p.notional:,.0f} per leg.
+  Exit: {p.hold_minutes}m, TP {p.tp_pct}%, or EOD. ${p.notional:,.0f} on {ticker_a}, ${p.notional:,.0f}×β₂₀ on {ticker_b}.
 </div>
 <p id="trade-meta">Select a trade.</p>
 <div id="legs-panel"></div>
