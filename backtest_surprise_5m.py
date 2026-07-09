@@ -15,6 +15,7 @@ Signals (one position at a time; re-entry after flat):
 Exit:
   • 15 minutes after entry (3 × 5-min bars), or
   • Take profit when position PnL ≥ +tp_pct on $10k leg, or
+  • Session loss cap (default $100 max loss per session), or
   • EOD (last RTH bar) if < 15 min remain in session
 
 $10k notional on PAAS; SLV leg sized **$10k × β₂₀** (beta-hedged book).
@@ -52,6 +53,7 @@ class SurpriseParams:
     tp_pct: float = 1.0
     beta_lookback: int = 20
     notional: float = 10_000.0
+    max_session_loss: float = 100.0
 
 
 def _leg_breakdown_pair(
@@ -215,7 +217,7 @@ def build_5m_surprise_bars(
     return pd.DataFrame(rows).sort_values(["Trading date", "DT"]).reset_index(drop=True)
 
 
-def _position_pnl_pct(
+def _position_pnl_usd(
     side: str,
     notional: float,
     beta_20: float,
@@ -225,7 +227,79 @@ def _position_pnl_pct(
     exit_b: float,
 ) -> float:
     legs = _leg_breakdown_pair(side, notional, entry_a, entry_b, exit_a, exit_b, beta_20)
-    return 100.0 * legs["PnL_total_usd"] / notional if notional else 0.0
+    return legs["PnL_total_usd"]
+
+
+def _cap_session_pnl(session_pnl: float, raw_pnl: float, max_session_loss: float) -> float:
+    """Floor trade PnL so session realized loss does not exceed ``max_session_loss``."""
+    if max_session_loss <= 0:
+        return raw_pnl
+    return max(raw_pnl, -max_session_loss - session_pnl)
+
+
+def _scale_leg_pnl(legs: dict, capped_total: float) -> dict:
+    raw = legs["PnL_total_usd"]
+    if raw == 0 or abs(raw - capped_total) < 1e-9:
+        return legs
+    scale = capped_total / raw
+    out = dict(legs)
+    out["PnL_A_usd"] = round(legs["PnL_A_usd"] * scale, 2)
+    out["PnL_B_usd"] = round(legs["PnL_B_usd"] * scale, 2)
+    out["PnL_total_usd"] = round(capped_total, 2)
+    return out
+
+
+def _append_fill(
+    fills: list[dict],
+    *,
+    td: int,
+    pos: dict,
+    dt: pd.Timestamp,
+    pa: float,
+    pb: float,
+    reason: str,
+    session_pnl: float,
+    p: SurpriseParams,
+    ticker_a: str,
+    ticker_b: str,
+) -> float:
+    """Close ``pos``; return updated session PnL."""
+    beta_e = float(pos["beta_20"])
+    legs = _leg_breakdown_pair(
+        pos["side"], p.notional, pos["entry_a"], pos["entry_b"], pa, pb, beta_e
+    )
+    raw_pnl = legs["PnL_total_usd"]
+    capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, p.max_session_loss)
+    if abs(capped_pnl - raw_pnl) > 1e-9:
+        legs = _scale_leg_pnl(legs, capped_pnl)
+        reason = f"{reason} (session cap)"
+
+    pnl_pct = 100.0 * capped_pnl / p.notional if p.notional else 0.0
+    fills.append(
+        {
+            "Trading date": td,
+            "Side": pos["side_label"],
+            "Entry_time": pd.Timestamp(pos["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
+            "Exit_time": pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M"),
+            "Entry_surprise_pct": round(pos["surprise_pct"], 4),
+            "Exit_reason": reason,
+            "Entry_beta_20": round(beta_e, 4),
+            f"Entry_{ticker_a}": round(pos["entry_a"], 4),
+            f"Entry_{ticker_b}": round(pos["entry_b"], 4),
+            f"Exit_{ticker_a}": round(pa, 4),
+            f"Exit_{ticker_b}": round(pb, 4),
+            "Return_pct": round(pnl_pct, 4),
+            "PnL_$": round(capped_pnl, 2),
+            "PnL_A_$": legs["PnL_A_usd"],
+            "PnL_B_$": legs["PnL_B_usd"],
+            "_legs": legs,
+        }
+    )
+    return session_pnl + capped_pnl
+
+
+def _session_loss_limit_hit(session_pnl: float, max_session_loss: float) -> bool:
+    return max_session_loss > 0 and session_pnl <= -max_session_loss
 
 
 def simulate_session(
@@ -239,17 +313,20 @@ def simulate_session(
     tp = p.tp_pct / 100.0
     hold_delta = pd.Timedelta(minutes=p.hold_minutes)
     fills: list[dict] = []
-    trade_id_base = 0
-
+    session_pnl = 0.0
+    session_done = False
     pos: dict | None = None
 
     for _, row in day.iterrows():
+        if session_done:
+            break
+
         dt = row["DT"]
         pa = float(row["price_a"])
         pb = float(row["price_b"])
 
         if pos is not None:
-            pnl_pct = _position_pnl_pct(
+            unrealized = _position_pnl_usd(
                 pos["side"],
                 p.notional,
                 float(pos["beta_20"]),
@@ -257,14 +334,21 @@ def simulate_session(
                 pos["entry_b"],
                 pa,
                 pb,
-            ) / 100.0
+            )
+            pnl_pct = unrealized / p.notional if p.notional else 0.0
 
+            cap_exit = (
+                p.max_session_loss > 0
+                and session_pnl + unrealized <= -p.max_session_loss
+            )
             time_exit = dt >= pos["entry_dt"] + hold_delta
             tp_exit = pnl_pct >= tp
             eod_exit = dt >= row["last_dt"]
 
             reason: str | None = None
-            if tp_exit:
+            if cap_exit:
+                reason = "Session loss cap"
+            elif tp_exit:
                 reason = f"TP {pnl_pct*100:.2f}%"
             elif time_exit:
                 reason = f"Hold {p.hold_minutes}m"
@@ -272,39 +356,28 @@ def simulate_session(
                 reason = "EOD"
 
             if reason:
-                beta_e = float(pos["beta_20"])
-                legs = _leg_breakdown_pair(
-                    pos["side"],
-                    p.notional,
-                    pos["entry_a"],
-                    pos["entry_b"],
-                    pa,
-                    pb,
-                    beta_e,
-                )
-                fills.append(
-                    {
-                        "Trading date": td,
-                        "Side": pos["side_label"],
-                        "Entry_time": pd.Timestamp(pos["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
-                        "Exit_time": pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M"),
-                        "Entry_surprise_pct": round(pos["surprise_pct"], 4),
-                        "Exit_reason": reason,
-                        "Entry_beta_20": round(beta_e, 4),
-                        f"Entry_{ticker_a}": round(pos["entry_a"], 4),
-                        f"Entry_{ticker_b}": round(pos["entry_b"], 4),
-                        f"Exit_{ticker_a}": round(pa, 4),
-                        f"Exit_{ticker_b}": round(pb, 4),
-                        "Return_pct": round(pnl_pct * 100, 4),
-                        "PnL_$": round(legs["PnL_total_usd"], 2),
-                        "PnL_A_$": legs["PnL_A_usd"],
-                        "PnL_B_$": legs["PnL_B_usd"],
-                        "_legs": legs,
-                    }
+                session_pnl = _append_fill(
+                    fills,
+                    td=td,
+                    pos=pos,
+                    dt=dt,
+                    pa=pa,
+                    pb=pb,
+                    reason=reason,
+                    session_pnl=session_pnl,
+                    p=p,
+                    ticker_a=ticker_a,
+                    ticker_b=ticker_b,
                 )
                 pos = None
+                if _session_loss_limit_hit(session_pnl, p.max_session_loss):
+                    session_done = True
 
-        if pos is None:
+        if pos is None and not session_done:
+            if _session_loss_limit_hit(session_pnl, p.max_session_loss):
+                session_done = True
+                continue
+
             surprise = float(row["surprise_pct"]) / 100.0
             if surprise > thresh:
                 pos = {
@@ -327,43 +400,20 @@ def simulate_session(
                     "surprise_pct": float(row["surprise_pct"]),
                 }
 
-    if pos is not None:
+    if pos is not None and not session_done:
         last_row = day.iloc[-1]
-        dt = last_row["DT"]
-        pa = float(last_row["price_a"])
-        pb = float(last_row["price_b"])
-        pnl_pct = _position_pnl_pct(
-            pos["side"],
-            p.notional,
-            float(pos["beta_20"]),
-            pos["entry_a"],
-            pos["entry_b"],
-            pa,
-            pb,
-        ) / 100.0
-        beta_e = float(pos["beta_20"])
-        legs = _leg_breakdown_pair(
-            pos["side"], p.notional, pos["entry_a"], pos["entry_b"], pa, pb, beta_e
-        )
-        fills.append(
-            {
-                "Trading date": td,
-                "Side": pos["side_label"],
-                "Entry_time": pd.Timestamp(pos["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
-                "Exit_time": pd.Timestamp(dt).strftime("%Y-%m-%d %H:%M"),
-                "Entry_surprise_pct": round(pos["surprise_pct"], 4),
-                "Exit_reason": "EOD",
-                "Entry_beta_20": round(beta_e, 4),
-                f"Entry_{ticker_a}": round(pos["entry_a"], 4),
-                f"Entry_{ticker_b}": round(pos["entry_b"], 4),
-                f"Exit_{ticker_a}": round(pa, 4),
-                f"Exit_{ticker_b}": round(pb, 4),
-                "Return_pct": round(pnl_pct * 100, 4),
-                "PnL_$": round(legs["PnL_total_usd"], 2),
-                "PnL_A_$": legs["PnL_A_usd"],
-                "PnL_B_$": legs["PnL_B_usd"],
-                "_legs": legs,
-            }
+        session_pnl = _append_fill(
+            fills,
+            td=td,
+            pos=pos,
+            dt=last_row["DT"],
+            pa=float(last_row["price_a"]),
+            pb=float(last_row["price_b"]),
+            reason="EOD",
+            session_pnl=session_pnl,
+            p=p,
+            ticker_a=ticker_a,
+            ticker_b=ticker_b,
         )
 
     return fills
@@ -415,6 +465,7 @@ def summary_stats(
     n_tp = trades_df["Exit_reason"].astype(str).str.startswith("TP").sum()
     n_hold = trades_df["Exit_reason"].astype(str).str.startswith("Hold").sum()
     n_eod = (trades_df["Exit_reason"] == "EOD").sum()
+    n_cap = trades_df["Exit_reason"].astype(str).str.contains("Session loss cap").sum()
 
     rows = [
         ("Trades", n),
@@ -427,6 +478,8 @@ def summary_stats(
         ("TP exits", int(n_tp)),
         ("Time exits (15m)", int(n_hold)),
         ("EOD exits", int(n_eod)),
+        ("Session loss cap exits", int(n_cap)),
+        ("Max session loss ($)", p.max_session_loss if p.max_session_loss > 0 else "off"),
         ("Bar size", f"{BAR_MINUTES} min"),
         ("Surprise threshold (%)", f"±{p.threshold_pct}"),
         ("β₂₀ lookback", p.beta_lookback),
@@ -571,7 +624,7 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 <div id="explainer">
   surprise = r_{ticker_a}(since prior close) − β₂₀×r_{ticker_b}(since prior close) on {BAR_MINUTES}m bars.<br>
   surprise &gt; +{p.threshold_pct}% → Short {ticker_a}, Long {ticker_b}. &lt; −{p.threshold_pct}% → opposite.<br>
-  Exit: {p.hold_minutes}m, TP {p.tp_pct}%, or EOD. ${p.notional:,.0f} on {ticker_a}, ${p.notional:,.0f}×β₂₀ on {ticker_b}.
+  Exit: {p.hold_minutes}m, TP {p.tp_pct}%, max session loss ${p.max_session_loss:.0f}, or EOD.
 </div>
 <p id="trade-meta">Select a trade.</p>
 <div id="legs-panel"></div>
@@ -622,6 +675,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tp-pct", type=float, default=1.0)
     p.add_argument("--beta-lookback", type=int, default=20)
     p.add_argument("--notional", type=float, default=10_000.0)
+    p.add_argument(
+        "--max-session-loss",
+        type=float,
+        default=100.0,
+        help="Max realized loss per session ($); 0 = disable",
+    )
     p.add_argument("--data-folder", default=None)
     p.add_argument("--output", default="surprise_5m_backtest.html")
     p.add_argument("--no-browser", action="store_true")
@@ -637,6 +696,7 @@ def main() -> None:
         tp_pct=args.tp_pct,
         beta_lookback=args.beta_lookback,
         notional=args.notional,
+        max_session_loss=args.max_session_loss,
     )
     folder = args.data_folder or Paths().min_folder
 
