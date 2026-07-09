@@ -8,7 +8,7 @@ import pandas as pd
 
 from .config import Paths
 from .loaders import market_calendar
-from .spread import ols_beta, pair_15min_returns
+from .spread import attach_adapted_beta_spread, ols_beta, pair_15min_returns
 
 
 def load_ticker_minutes(
@@ -175,17 +175,37 @@ def _valid_bar_returns(
     return pd.DataFrame(rows)
 
 
+def _cumsum_skip_nan(series: pd.Series) -> pd.Series:
+    """Session cumsum that only accumulates non-NaN values."""
+    out: list[float] = []
+    total = 0.0
+    for v in series:
+        if pd.isna(v):
+            out.append(float("nan"))
+        else:
+            total += float(v)
+            out.append(total)
+    return pd.Series(out, index=series.index)
+
+
 def attach_diff_ret(
     df: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
     return_minutes: int = 5,
+    *,
+    beta_window: int = 30,
+    beta_warmup: int = 30,
+    include_adapted: bool = False,
 ) -> pd.DataFrame:
     """
     diff_ret = r_A − β_D×r_B on ``return_minutes`` bar returns; cumsum within session.
 
     Returns are computed only on bars with full 1-min coverage (no gap filling).
     β_D is from the prior session's 15-min returns (computed on the 1-min panel).
+
+    When ``include_adapted`` is True, also adds rolling-session ``beta_adapted``,
+    ``diff_ret_adapted``, and ``cum_diff_ret_adapted`` (NaN until warmup elapses).
     """
     beta_d = prior_session_15m_beta_by_date(df, ticker_a, ticker_b)
     bars = _valid_bar_returns(df, ticker_a, ticker_b, return_minutes)
@@ -199,4 +219,16 @@ def attach_diff_ret(
         return df.iloc[:0].copy()
     bars["ind_nyse_rth"] = True
     bars["cum_diff_ret"] = bars.groupby("Trading date", group_keys=False)["diff_ret"].cumsum()
+
+    if include_adapted:
+        one_min = attach_adapted_beta_spread(
+            df, ticker_a, ticker_b, beta_window, beta_warmup
+        )
+        beta_by_dt = one_min.set_index("DT")["beta_adapted"]
+        bars["beta_adapted"] = bars["DT"].map(beta_by_dt)
+        bars["diff_ret_adapted"] = bars["ret_a"] - bars["beta_adapted"] * bars["ret_b"]
+        bars["cum_diff_ret_adapted"] = bars.groupby("Trading date", group_keys=False)[
+            "diff_ret_adapted"
+        ].transform(_cumsum_skip_nan)
+
     return bars.sort_values("DT").reset_index(drop=True)

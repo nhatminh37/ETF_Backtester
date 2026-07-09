@@ -6,7 +6,12 @@ Signal (session cumulative diff_ret from open):
   diff_ret = r_A − β_D×r_B  (5-min bar returns by default)
   cum_diff = Σ diff_ret within session
 
-Long when cum_diff >= +entry_pct; short when cum_diff <= −entry_pct.
+Long when cum_diff (β_D) >= +entry_pct AND cum_diff_adapted (β_adapted) >= +adapted_pct.
+Short when both <= −thresholds (mirror).
+
+β_D = prior session 15m OLS. β_adapted = rolling 30m OLS (available after 30 min RTH).
+The adapted leg acts as a confirmation filter: yesterday's overreaction must still
+show up under today's hedge ratio, not just silver drift or stale β.
 
 Take profit (each 20%% of **initial** size, 5 levels):
   Long:  entry+0.6, +0.7, +0.8, +0.9, +1.0 pct pts above entry (default 2.1…2.5)
@@ -44,7 +49,11 @@ def _pct(x: float) -> float:
 
 @dataclass
 class StrategyParams:
-    entry_pct: float = 1.5
+    entry_pct: float = 1.0
+    adapted_pct: float = 1.0
+    require_adapted_confirm: bool = True
+    beta_window: int = 30
+    beta_warmup: int = 30
     tp_start_pct: float = 2.1
     tp_step_pct: float = 0.1
     tp_slices: int = 5
@@ -158,12 +167,15 @@ def simulate_session(
 
     entry_long = _pct(p.entry_pct)
     entry_short = -entry_long
+    adapted_long = _pct(p.adapted_pct)
+    adapted_short = -adapted_long
 
     for row in day.itertuples(index=False):
         dr = row.diff_ret
         if pd.isna(dr) or pd.isna(row.cum_diff_ret):
             continue
         cum = float(row.cum_diff_ret)
+        cum_ad = float(row.cum_diff_ret_adapted) if hasattr(row, "cum_diff_ret_adapted") and pd.notna(row.cum_diff_ret_adapted) else float("nan")
         dt = row.DT
 
         can_enter = (
@@ -173,14 +185,30 @@ def simulate_session(
             and pd.notna(row.beta_D)
         )
         if can_enter:
-            if cum >= entry_long:
+            adapted_ok_long = (
+                not p.require_adapted_confirm
+                or (pd.notna(cum_ad) and cum_ad >= adapted_long)
+            )
+            adapted_ok_short = (
+                not p.require_adapted_confirm
+                or (pd.notna(cum_ad) and cum_ad <= adapted_short)
+            )
+            beta_ad = (
+                float(row.beta_adapted)
+                if hasattr(row, "beta_adapted") and pd.notna(row.beta_adapted)
+                else float("nan")
+            )
+            if cum >= entry_long and adapted_ok_long:
                 session_used = True
                 long_pos = OpenPosition("long", cum, dt)
                 _record_fill(
                     fills,
                     td=td,
                     side="long",
-                    reason=f"Entry (β_D={row.beta_D:.3f})",
+                    reason=(
+                        f"Entry (β_D={row.beta_D:.3f}, β_ad={beta_ad:.3f}, "
+                        f"cum_D={cum * 100:.2f}%, cum_ad={cum_ad * 100:.2f}%)"
+                    ),
                     dt=dt,
                     frac=0.0,
                     entry_cum=cum,
@@ -189,14 +217,17 @@ def simulate_session(
                     remaining=1.0,
                     notional=p.notional,
                 )
-            elif cum <= entry_short:
+            elif cum <= entry_short and adapted_ok_short:
                 session_used = True
                 short_pos = OpenPosition("short", cum, dt)
                 _record_fill(
                     fills,
                     td=td,
                     side="short",
-                    reason=f"Entry (β_D={row.beta_D:.3f})",
+                    reason=(
+                        f"Entry (β_D={row.beta_D:.3f}, β_ad={beta_ad:.3f}, "
+                        f"cum_D={cum * 100:.2f}%, cum_ad={cum_ad * 100:.2f}%)"
+                    ),
                     dt=dt,
                     frac=0.0,
                     entry_cum=cum,
@@ -288,10 +319,16 @@ def summary_stats(daily_df: pd.DataFrame, fills_df: pd.DataFrame, p: StrategyPar
         ("Win days (%)", round(100 * win_days / n_days, 1)),
         ("Exit fills", len(exits)),
         ("Notional per full leg", p.notional),
-        ("Entry threshold (%)", p.entry_pct),
+        ("Entry threshold β_D (%)", p.entry_pct),
+        (
+            "Adapted confirm",
+            f"±{p.adapted_pct}% cum (roll {p.beta_window}m β)"
+            if p.require_adapted_confirm
+            else "off",
+        ),
         ("TP levels (%)", f"{p.tp_start_pct}…{p.tp_start_pct + (p.tp_slices - 1) * p.tp_step_pct} step {p.tp_step_pct}"),
         ("Return bar (min)", p.return_minutes),
-        ("Hedge β", "β_D (prior day 15m) in signal & PnL"),
+        ("Signal / PnL hedge", "β_D (prior day 15m)"),
         ("Stop loss", "none"),
         ("Max entries / session", 1 if p.one_trade_per_day else "unlimited"),
     ]
@@ -379,7 +416,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ticker-b", default="SLV")
     p.add_argument("--start", type=int, default=default_start)
     p.add_argument("--end", type=int, default=default_end)
-    p.add_argument("--entry", type=float, default=1.5, help="Entry |cum_diff| threshold (%%)")
+    p.add_argument("--entry", type=float, default=1.0, help="β_D cum_diff entry threshold (%%)")
+    p.add_argument(
+        "--adapted-pct",
+        type=float,
+        default=1.0,
+        help="β_adapted cum_diff confirmation threshold (%%); default same as --entry",
+    )
+    p.add_argument(
+        "--no-adapted-filter",
+        action="store_true",
+        help="Disable β_adapted confirmation (β_D signal only)",
+    )
+    p.add_argument("--beta-window", type=int, default=30, help="Rolling minutes for β_adapted")
+    p.add_argument("--beta-warmup", type=int, default=30, help="Warmup minutes before β_adapted")
     p.add_argument("--tp-start", type=float, default=2.1, help="First TP level for long (%% cum)")
     p.add_argument("--notional", type=float, default=10_000.0)
     p.add_argument(
@@ -400,6 +450,10 @@ def main() -> None:
     folder = args.data_folder or Paths().min_folder
     params = StrategyParams(
         entry_pct=args.entry,
+        adapted_pct=args.adapted_pct,
+        require_adapted_confirm=not args.no_adapted_filter,
+        beta_window=args.beta_window,
+        beta_warmup=args.beta_warmup,
         tp_start_pct=args.tp_start,
         notional=args.notional,
         return_minutes=args.return_minutes,
@@ -409,7 +463,13 @@ def main() -> None:
     df = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
     n_1m = len(df)
     df = attach_diff_ret(
-        df, args.ticker_a, args.ticker_b, return_minutes=params.return_minutes
+        df,
+        args.ticker_a,
+        args.ticker_b,
+        return_minutes=params.return_minutes,
+        beta_window=params.beta_window,
+        beta_warmup=params.beta_warmup,
+        include_adapted=params.require_adapted_confirm,
     )
     print(
         f"  {df['Trading date'].nunique()} sessions, "
