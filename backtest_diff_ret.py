@@ -456,6 +456,7 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 #fills-panel {{ margin-top: 1rem; }}
 #fills-hint {{ color: #666; font-style: italic; }}
 #session-meta {{ margin: 0.5rem 0 1rem; color: #333; }}
+#cum-explainer {{ background: #f7f9fc; border-left: 4px solid #0066cc; padding: 0.75rem 1rem; margin: 0.5rem 0 1rem; font-size: 13px; line-height: 1.5; }}
 </style></head><body>
 <h1>β_D diff_ret ladder — {ticker_a} vs {ticker_b}</h1>
 <h2>Summary</h2>{summary_html}
@@ -464,6 +465,13 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 <p id="fills-hint">Click a daily row (or a daily PnL bar) to show fills with fill time.</p>
 {daily_html}
 <h2 id="fills-title">Session fills</h2>
+<div id="cum-explainer">
+  <strong>Not raw PAAS/SLV price.</strong>
+  Entry/exit columns are <em>session cumulative β_D hedged return</em>:
+  Σ(r_PAAS − β_D×r_SLV) from the 9:30 open on 5-min bars.
+  Short PnL ≈ notional × (position entry cum − session cum at fill).
+  Your chart may show β_adapted spread or dollar prices — those can differ from β_D cum here.
+</div>
 <p id="session-meta">No session selected.</p>
 <div id="fills-panel"><p>Select a date above.</p></div>
 <script>
@@ -489,15 +497,16 @@ function renderFills(td) {{
   meta.textContent = 'Trading date ' + td + ' | fills: ' + rows.length
     + ' | session PnL: $' + sessionPnl.toFixed(2) + ' (β_D cum)';
 
-  const cols = ['DT', 'Side', 'Reason', 'Frac', 'Entry_cum_pct', 'Exit_cum_pct', 'PnL_pct', 'PnL_$', 'Remaining'];
+  const cols = ['DT', 'Side', 'Reason', 'Frac', 'Entry_cum_pct', 'Exit_cum_pct', 'Move_pct', 'PnL_pct', 'PnL_$', 'Remaining'];
   const labels = {{
     DT: 'Fill time (ET)',
     Side: 'Side',
     Reason: 'Reason',
     Frac: 'Frac',
-    Entry_cum_pct: 'Entry cum %',
-    Exit_cum_pct: 'Exit cum %',
-    PnL_pct: 'PnL %',
+    Entry_cum_pct: 'Pos entry cum β_D %',
+    Exit_cum_pct: 'Session cum β_D % at fill',
+    Move_pct: 'Move vs pos entry %',
+    PnL_pct: 'PnL % (on frac)',
     'PnL_$': 'PnL $',
     Remaining: 'Remaining',
   }};
@@ -505,11 +514,22 @@ function renderFills(td) {{
   let html = '<table class="data-table"><thead><tr>';
   for (const c of cols) html += '<th>' + labels[c] + '</th>';
   html += '</tr></thead><tbody>';
+  const posEntry = rows.find(r => String(r.Reason).startsWith('Entry'));
+  const posEntryCum = posEntry ? posEntry.Entry_cum_pct : null;
   for (const r of rows) {{
+    const side = r.Side;
+    const cumAtFill = r.Exit_cum_pct;
+    let move = '';
+    if (posEntryCum !== null && !String(r.Reason).startsWith('Entry')) {{
+      move = side === 'long'
+        ? (cumAtFill - posEntryCum).toFixed(3)
+        : (posEntryCum - cumAtFill).toFixed(3);
+    }}
     html += '<tr>';
     for (const c of cols) {{
-      let v = r[c];
-      if (c === 'PnL_$' && typeof v === 'number') v = v.toFixed(2);
+      let v = c === 'Move_pct' ? move : r[c];
+      if ((c === 'PnL_$' || c === 'Move_pct') && typeof v === 'number') v = v.toFixed(2);
+      if (c === 'Move_pct' && v === '') v = '—';
       html += '<td>' + v + '</td>';
     }}
     html += '</tr>';

@@ -232,3 +232,28 @@ def attach_diff_ret(
         ].transform(_cumsum_skip_nan)
 
     return bars.sort_values("DT").reset_index(drop=True)
+
+
+def attach_diff_ret_1m(
+    df: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+) -> pd.DataFrame:
+    """
+    1-min ``diff_ret = r_A − β_D×r_B``; session cumsum on consecutive RTH minutes only.
+
+    β_D is from the prior session's 15-min returns.
+    """
+    beta_d = prior_session_15m_beta_by_date(df, ticker_a, ticker_b)
+    out = df.sort_values("DT").copy()
+    valid = out.groupby("Trading date")["DT"].diff().eq(pd.Timedelta(minutes=1))
+    out["ret_a"] = out.groupby("Trading date")[ticker_a].pct_change().where(valid)
+    out["ret_b"] = out.groupby("Trading date")[ticker_b].pct_change().where(valid)
+    out["beta_D"] = out["Trading date"].map(beta_d)
+    out["diff_ret"] = out["ret_a"] - out["beta_D"] * out["ret_b"]
+    out = out[out["beta_D"].notna() & out["diff_ret"].notna()].copy()
+    if out.empty:
+        return out
+    out["ind_nyse_rth"] = True
+    out["cum_diff_ret"] = out.groupby("Trading date", group_keys=False)["diff_ret"].cumsum()
+    return out.reset_index(drop=True)
