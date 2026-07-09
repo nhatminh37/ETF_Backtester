@@ -38,19 +38,14 @@ ANCHOR_MINUTE = 45
 @dataclass
 class Daily945Params:
     window: int = 20
-    entry_std: float = 1.5
+    entry_std: float = 2.0
     entry_lag: int = 0
     hold_days: int = 1
     notional: float = 10_000.0
 
 
-def _level_pnl(side: str, entry_level: float, exit_level: float) -> float:
-    denom = abs(entry_level)
-    if denom < 1e-9:
-        return 0.0
-    if side == "long":
-        return (exit_level - entry_level) / denom
-    return (entry_level - exit_level) / denom
+def _spread_level(price_a: float, price_b: float, beta: float) -> float:
+    return price_a - beta * price_b
 
 
 def _leg_breakdown(
@@ -85,7 +80,7 @@ def _leg_breakdown(
                 "Leg": "A",
                 "Action": entry_a_action,
                 "Price": round(price_a_entry, 4),
-                "Notional_$": round(n_a, 2),
+                "Notional_usd": round(n_a, 2),
                 "Shares": round(sh_a, 4),
             },
             {
@@ -93,7 +88,7 @@ def _leg_breakdown(
                 "Action": entry_b_action,
                 "Price": round(price_b_entry, 4),
                 "Beta_D": round(beta_entry, 4),
-                "Notional_$": round(n_b, 2),
+                "Notional_usd": round(n_b, 2),
                 "Shares": round(sh_b, 4),
             },
         ],
@@ -102,20 +97,20 @@ def _leg_breakdown(
                 "Leg": "A",
                 "Action": exit_a_action,
                 "Price": round(price_a_exit, 4),
-                "Notional_$": round(sh_a * price_a_exit, 2),
+                "Notional_usd": round(sh_a * price_a_exit, 2),
                 "Shares": round(sh_a, 4),
             },
             {
                 "Leg": "B",
                 "Action": exit_b_action,
                 "Price": round(price_b_exit, 4),
-                "Notional_$": round(sh_b * price_b_exit, 2),
+                "Notional_usd": round(sh_b * price_b_exit, 2),
                 "Shares": round(sh_b, 4),
             },
         ],
-        "PnL_A_$": round(pnl_a, 2),
-        "PnL_B_$": round(pnl_b, 2),
-        "PnL_total_$": round(pnl_a + pnl_b, 2),
+        "PnL_A_usd": round(pnl_a, 2),
+        "PnL_B_usd": round(pnl_b, 2),
+        "PnL_total_usd": round(pnl_a + pnl_b, 2),
     }
 
 
@@ -203,9 +198,6 @@ def run_backtest(
 
         entry_row = daily.iloc[entry_idx]
         exit_row = daily.iloc[exit_idx]
-        entry_level = float(entry_row["spread_level"])
-        exit_level = float(exit_row["spread_level"])
-        pnl_dec = _level_pnl(side, entry_level, exit_level)
 
         pa_e = float(entry_row["price_a"])
         pb_e = float(entry_row["price_b"])
@@ -214,6 +206,14 @@ def run_backtest(
         beta_e = float(entry_row["beta_D"])
         beta_x = float(exit_row["beta_D"])
         legs = _leg_breakdown(side, p.notional, beta_e, pa_e, pb_e, pa_x, pb_x)
+
+        # PnL from actual leg fills (β sized at entry). Do not use raw spread-level
+        # delta across days — β_D changes day to day so S_t is not comparable.
+        pnl_usd = legs["PnL_total_usd"]
+        return_pct = 100.0 * pnl_usd / p.notional if p.notional else 0.0
+
+        entry_level = _spread_level(pa_e, pb_e, beta_e)
+        exit_level_mark = _spread_level(pa_x, pb_x, beta_e)
 
         trade_id += 1
         trades.append(
@@ -234,16 +234,15 @@ def run_backtest(
                 f"Entry_{ticker_b}": round(pb_e, 4),
                 "Exit_date": int(exit_row["Trading date"]),
                 "Exit_time": pd.Timestamp(exit_row["DT"]).strftime("%Y-%m-%d %H:%M"),
-                "Exit_spread_$": round(exit_level, 4),
+                "Exit_spread_$": round(exit_level_mark, 4),
                 "Exit_beta_D": round(beta_x, 4),
                 f"Exit_{ticker_a}": round(pa_x, 4),
                 f"Exit_{ticker_b}": round(pb_x, 4),
-                "Spread_move_$": round(exit_level - entry_level, 4),
-                "Return_pct": round(pnl_dec * 100, 4),
-                "PnL_$": round(pnl_dec * p.notional, 2),
-                "PnL_legs_$": legs["PnL_total_$"],
-                "PnL_A_$": legs["PnL_A_$"],
-                "PnL_B_$": legs["PnL_B_$"],
+                "Spread_move_$": round(exit_level_mark - entry_level, 4),
+                "Return_pct": round(return_pct, 4),
+                "PnL_$": round(pnl_usd, 2),
+                "PnL_A_$": legs["PnL_A_usd"],
+                "PnL_B_$": legs["PnL_B_usd"],
                 "_legs": legs,
             }
         )
@@ -395,9 +394,9 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Exit_B": float(row[f"Exit_{ticker_b}"]),
             "Spread_move_$": float(row["Spread_move_$"]),
             "Return_pct": float(row["Return_pct"]),
-            "PnL_$": float(row["PnL_$"]),
-            "PnL_A_$": float(row["PnL_A_$"]),
-            "PnL_B_$": float(row["PnL_B_$"]),
+            "PnL_usd": float(row["PnL_$"]),
+            "PnL_A_usd": float(row["PnL_A_$"]),
+            "PnL_B_usd": float(row["PnL_B_$"]),
             "legs": legs,
             "ticker_a": ticker_a,
             "ticker_b": ticker_b,
@@ -509,7 +508,7 @@ function legTable(title, time, rows, tickerA, tickerB) {{
   for (const r of rows) {{
     const ticker = r.Leg === 'A' ? tickerA : tickerB;
     html += '<tr><td>' + r.Leg + '</td><td>' + ticker + '</td><td>' + r.Action + '</td>';
-    html += '<td>' + r.Price + '</td><td>' + r.Notional_$ + '</td><td>' + r.Shares + '</td>';
+    html += '<td>' + r.Price + '</td><td>' + r.Notional_usd + '</td><td>' + r.Shares + '</td>';
     html += '<td>' + (r.Beta_D !== undefined ? r.Beta_D : '—') + '</td></tr>';
   }}
   html += '</tbody></table></div>';
@@ -529,22 +528,23 @@ function renderTrade(tradeId) {{
   }}
 
   title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' spread';
+  const pnlTotal = t.PnL_A_usd + t.PnL_B_usd;
   meta.textContent =
     'Signal ' + t.Signal_date + ' (z=' + t.Signal_z + ') | '
     + 'Entry ' + t.Entry_date + ' ' + t.Entry_time + ' | '
     + 'Exit ' + t.Exit_date + ' ' + t.Exit_time + ' | '
-    + 'PnL $' + t.PnL_$.toFixed(2) + ' (' + t.Return_pct.toFixed(3) + '%)';
+    + 'PnL $' + pnlTotal.toFixed(2) + ' (' + t.Return_pct.toFixed(3) + '%)';
 
-  let html = '<p><b>Spread level:</b> $' + t.Entry_spread_$.toFixed(4)
+  let html = '<p><b>Spread level (entry β_D):</b> $' + t.Entry_spread_$.toFixed(4)
     + ' → $' + t.Exit_spread_$.toFixed(4)
     + ' (Δ $' + t.Spread_move_$.toFixed(4) + ')</p>';
   html += '<p><b>β_D:</b> entry ' + t.Entry_beta_D + ', exit ' + t.Exit_beta_D + '</p>';
   html += legTable('Entry legs', t.Entry_time, t.legs.entry, t.ticker_a, t.ticker_b);
   html += legTable('Exit legs', t.Exit_time, t.legs.exit, t.ticker_a, t.ticker_b);
   html += '<table class="data-table"><thead><tr><th>Leg PnL</th><th>$</th></tr></thead><tbody>';
-  html += '<tr><td>' + t.ticker_a + '</td><td>' + t.PnL_A_$.toFixed(2) + '</td></tr>';
-  html += '<tr><td>' + t.ticker_b + ' (hedge)</td><td>' + t.PnL_B_$.toFixed(2) + '</td></tr>';
-  html += '<tr><td><b>Total</b></td><td><b>' + t.PnL_$.toFixed(2) + '</b></td></tr>';
+  html += '<tr><td>' + t.ticker_a + '</td><td>' + t.PnL_A_usd.toFixed(2) + '</td></tr>';
+  html += '<tr><td>' + t.ticker_b + ' (hedge)</td><td>' + t.PnL_B_usd.toFixed(2) + '</td></tr>';
+  html += '<tr><td><b>Total</b></td><td><b>' + pnlTotal.toFixed(2) + '</b></td></tr>';
   html += '</tbody></table>';
   panel.innerHTML = html;
 }}
@@ -572,7 +572,7 @@ function selectDailyRow(td) {{
     let html = '<ul>';
     ids.forEach(id => {{
       const t = TRADES[String(id)];
-      html += '<li><a href="#" data-trade="' + id + '">#' + id + ' ' + t.Side + ' PnL $' + t.PnL_$.toFixed(2) + '</a></li>';
+      html += '<li><a href="#" data-trade="' + id + '">#' + id + ' ' + t.Side + ' PnL $' + (t.PnL_A_usd + t.PnL_B_usd).toFixed(2) + '</a></li>';
     }});
     html += '</ul>';
     document.getElementById('legs-panel').innerHTML = html;
@@ -636,7 +636,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--start", type=int, default=default_start)
     p.add_argument("--end", type=int, default=default_end)
     p.add_argument("--window", type=int, default=20)
-    p.add_argument("--entry-std", type=float, default=1.5)
+    p.add_argument("--entry-std", type=float, default=2.0)
     p.add_argument("--entry-lag", type=int, default=0)
     p.add_argument("--hold-days", type=int, default=1)
     p.add_argument("--notional", type=float, default=10_000.0)
