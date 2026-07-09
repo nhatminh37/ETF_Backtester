@@ -318,9 +318,12 @@ def beta20_price_spread_figure(
     show_level: bool = True,
     height: int = 920,
     width: int = 1500,
+    line_width: float | None = None,
 ) -> "go.Figure":
     """
     Large Plotly chart for β₂₀ dollar price spread (1-min RTH).
+
+    Pass ``trading_date=None`` to plot every session between the dates in ``df``.
 
     ``show_vs_open``: session spread change from open ($) — usually easiest to read.
     ``show_level``: raw ``P_A − β₂₀×P_B`` level ($).
@@ -348,8 +351,15 @@ def beta20_price_spread_figure(
         if trading_date is not None
         else f"{int(sub['Trading date'].min())}–{int(sub['Trading date'].max())}"
     )
-    beta_val = sub[beta_col].dropna().iloc[0] if sub[beta_col].notna().any() else float("nan")
-    beta_txt = f"{beta_val:.3f}" if pd.notna(beta_val) else "n/a"
+    n_sessions = sub["Trading date"].nunique()
+    if trading_date is not None:
+        beta_val = sub[beta_col].dropna().iloc[0] if sub[beta_col].notna().any() else float("nan")
+        beta_txt = f"{beta_val:.3f}" if pd.notna(beta_val) else "n/a"
+    else:
+        beta_txt = f"{n_sessions} sessions (β₂₀ fixed per day)"
+
+    if line_width is None:
+        line_width = 2.8 if n_sessions <= 2 else (1.2 if n_sessions <= 30 else 0.6)
 
     rows = int(show_vs_open) + int(show_level)
     if rows == 0:
@@ -378,7 +388,7 @@ def beta20_price_spread_figure(
                 y=sub[vs_open_col],
                 mode="lines",
                 name="vs open ($)",
-                line=dict(width=2.8, color="#1f77b4"),
+                line=dict(width=line_width, color="#1f77b4"),
             ),
             row=row,
             col=1,
@@ -393,7 +403,7 @@ def beta20_price_spread_figure(
                 y=sub[level_col],
                 mode="lines",
                 name="level ($)",
-                line=dict(width=2.8, color="#d62728"),
+                line=dict(width=line_width, color="#d62728"),
             ),
             row=row,
             col=1,

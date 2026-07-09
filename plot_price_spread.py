@@ -6,9 +6,11 @@ Large charts for readability. Uses helpers in ``silver_backtesting.spread``.
 
 Usage::
 
-    python plot_price_spread.py --date 20250910
-    python plot_price_spread.py --start 20250901 --end 20250915 --date 20250910 --output spread_price.html
-    python plot_price_spread.py --date 20250910 --level-only
+    # Full year (all RTH minutes in range):
+    python plot_price_spread.py --start 20250101 --end 20251231 --mode range
+
+    # Single session:
+    python plot_price_spread.py --start 20250101 --end 20251231 --date 20250910 --mode day
 """
 
 from __future__ import annotations
@@ -34,7 +36,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ticker-b", default="SLV")
     p.add_argument("--start", type=int, default=default_start)
     p.add_argument("--end", type=int, default=default_end)
-    p.add_argument("--date", type=int, default=None, help="Session to plot (YYYYMMDD)")
+    p.add_argument("--date", type=int, default=None, help="Single session (mode=day only)")
+    p.add_argument(
+        "--mode",
+        choices=("day", "range"),
+        default=None,
+        help="'range' = all sessions in start–end (default if --date omitted); "
+        "'day' = one session (--date or last day in range)",
+    )
     p.add_argument("--beta-lookback", type=int, default=20)
     p.add_argument("--data-folder", default=None)
     p.add_argument("--output", default=None)
@@ -49,9 +58,9 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     folder = args.data_folder or Paths().min_folder
-    focus = args.date or args.end
+    mode = args.mode or ("day" if args.date is not None else "range")
 
-    print(f"Loading {args.ticker_a}/{args.ticker_b} …")
+    print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}) …")
     panel = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
     df = attach_beta20_price_spread(
         panel,
@@ -59,24 +68,31 @@ def main() -> None:
         args.ticker_b,
         lookback_days=args.beta_lookback,
     )
+    n_sessions = df["Trading date"].nunique()
+    print(f"  {n_sessions} sessions, {len(df):,} 1-min bars")
 
-    if focus not in set(df["Trading date"].astype(int)):
-        raise SystemExit(f"No data for --date {focus} in loaded range.")
-
-    beta_col = f"{args.ticker_a}-{args.ticker_b}_beta20"
-    beta = df.loc[df["Trading date"] == focus, beta_col].dropna()
-    print(f"  β₂₀ on {focus}: {beta.iloc[0]:.4f}" if not beta.empty else f"  β₂₀ on {focus}: n/a")
+    if mode == "day":
+        focus = args.date or int(df["Trading date"].max())
+        if focus not in set(df["Trading date"].astype(int)):
+            raise SystemExit(f"No data for --date {focus} in loaded range.")
+        trading_date: int | None = focus
+        print(f"  mode=day, plotting {focus}")
+    else:
+        trading_date = None
+        print(f"  mode=range, plotting {args.start}–{args.end}")
 
     show_vs_open = not args.level_only
     show_level = not args.vs_open_only
+    height = args.height if mode == "day" else max(args.height, 1000)
+
     fig = beta20_price_spread_figure(
         df,
         args.ticker_a,
         args.ticker_b,
-        trading_date=focus,
+        trading_date=trading_date,
         show_vs_open=show_vs_open,
         show_level=show_level,
-        height=args.height,
+        height=height,
         width=args.width,
     )
 
