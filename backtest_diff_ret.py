@@ -29,6 +29,7 @@ Usage (Windows one line)::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import webbrowser
 from dataclasses import dataclass, field
@@ -340,6 +341,58 @@ def _trading_dates_for_plot(daily_df: pd.DataFrame) -> pd.Series:
     return pd.to_datetime(daily_df["Trading date"].astype(str), format="%Y%m%d")
 
 
+def _daily_table_html(daily_df: pd.DataFrame) -> str:
+    """Clickable daily PnL table; rows carry ``data-td`` for fill drill-down."""
+    if daily_df.empty:
+        return "<p>No trades</p>"
+
+    cols = list(daily_df.columns)
+    parts = [
+        "<table id='daily-pnl-table' class='data-table interactive-table'>",
+        "<thead><tr>",
+        *[f"<th>{c}</th>" for c in cols],
+        "</tr></thead><tbody>",
+    ]
+    for _, row in daily_df.iterrows():
+        td = int(row["Trading date"])
+        parts.append(f"<tr class='daily-row' data-td='{td}' tabindex='0'>")
+        for c in cols:
+            val = row[c]
+            if c in ("Session_PnL_$", "Cum_PnL_$") and pd.notna(val):
+                text = f"{float(val):,.2f}"
+            else:
+                text = str(val)
+            parts.append(f"<td>{text}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _fills_json(fills_df: pd.DataFrame) -> str:
+    """Serialize fills grouped by trading date for client-side drill-down."""
+    if fills_df.empty:
+        return "{}"
+
+    grouped: dict[str, list[dict]] = {}
+    for td, grp in fills_df.groupby("Trading date"):
+        rows: list[dict] = []
+        for rec in grp.sort_values("DT").to_dict(orient="records"):
+            item = {
+                "DT": pd.Timestamp(rec["DT"]).strftime("%Y-%m-%d %H:%M"),
+                "Side": rec["Side"],
+                "Reason": rec["Reason"],
+                "Frac": round(float(rec["Frac"]), 4),
+                "Entry_cum_pct": round(float(rec["Entry_cum_pct"]), 3),
+                "Exit_cum_pct": round(float(rec["Exit_cum_pct"]), 3),
+                "PnL_pct": round(float(rec["PnL_pct"]), 3),
+                "PnL_$": round(float(rec["PnL_$"]), 2),
+                "Remaining": round(float(rec["Remaining"]), 4),
+            }
+            rows.append(item)
+        grouped[str(int(td))] = rows
+    return json.dumps(grouped)
+
+
 def build_report_html(
     summary: pd.DataFrame,
     daily_df: pd.DataFrame,
@@ -374,35 +427,135 @@ def build_report_html(
     fig.update_xaxes(title_text="Trading date", row=2, col=1)
     fig.update_yaxes(title_text="Daily PnL ($)", row=1, col=1)
     fig.update_yaxes(title_text="Cumulative PnL ($)", row=2, col=1)
-    chart = fig.to_html(full_html=False, include_plotlyjs="cdn")
+    chart = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="pnl-chart")
 
     summary_html = summary.to_html(index=False, classes="data-table", border=0)
-    daily_html = (
-        daily_df.to_html(index=False, classes="data-table", border=0)
+    daily_html = _daily_table_html(daily_df)
+    fills_data = _fills_json(fills_df)
+    td_dates = (
+        {
+            str(int(td)): pd.to_datetime(str(int(td)), format="%Y%m%d").strftime("%Y-%m-%d")
+            for td in daily_df["Trading date"].unique()
+        }
         if not daily_df.empty
-        else "<p>No trades</p>"
+        else {}
     )
-    fills_preview = fills_df.head(200)
-    fills_html = (
-        fills_preview.to_html(index=False, classes="data-table", border=0)
-        if not fills_preview.empty
-        else ""
-    )
+    td_dates_json = json.dumps(td_dates)
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>diff_ret backtest</title>
 <style>
 body {{ font-family: sans-serif; margin: 2rem; }}
-h1,h2 {{ color: #0066cc; }}
+h1,h2,h3 {{ color: #0066cc; }}
 table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
 th {{ background: #0066cc; color: white; padding: 6px; text-align: left; }}
 td {{ border: 1px solid #ddd; padding: 6px; }}
+.interactive-table tbody tr.daily-row {{ cursor: pointer; }}
+.interactive-table tbody tr.daily-row:hover {{ background: #eef6ff; }}
+.interactive-table tbody tr.daily-row.selected {{ background: #cce0ff; font-weight: 600; }}
+#fills-panel {{ margin-top: 1rem; }}
+#fills-hint {{ color: #666; font-style: italic; }}
+#session-meta {{ margin: 0.5rem 0 1rem; color: #333; }}
 </style></head><body>
 <h1>β_D diff_ret ladder — {ticker_a} vs {ticker_b}</h1>
 <h2>Summary</h2>{summary_html}
 <div>{chart}</div>
-<h2>Daily PnL</h2>{daily_html}
-<h2>Fills (first 200)</h2>{fills_html}
+<h2>Daily PnL</h2>
+<p id="fills-hint">Click a daily row (or a daily PnL bar) to show fills with fill time.</p>
+{daily_html}
+<h2 id="fills-title">Session fills</h2>
+<p id="session-meta">No session selected.</p>
+<div id="fills-panel"><p>Select a date above.</p></div>
+<script>
+const FILLS_BY_TD = {fills_data};
+const TD_LABELS = {td_dates_json};
+
+function renderFills(td) {{
+  const title = document.getElementById('fills-title');
+  const meta = document.getElementById('session-meta');
+  const panel = document.getElementById('fills-panel');
+  const rows = FILLS_BY_TD[String(td)] || [];
+  const label = TD_LABELS[String(td)] || td;
+
+  title.textContent = 'Session fills — ' + label;
+  if (!rows.length) {{
+    meta.textContent = 'No fills for ' + label + '.';
+    panel.innerHTML = '<p>No fills recorded.</p>';
+    return;
+  }}
+
+  const exits = rows.filter(r => !String(r.Reason).startsWith('Entry'));
+  const sessionPnl = exits.reduce((s, r) => s + r['PnL_$'], 0);
+  meta.textContent = 'Trading date ' + td + ' | fills: ' + rows.length
+    + ' | session PnL: $' + sessionPnl.toFixed(2) + ' (β_D cum)';
+
+  const cols = ['DT', 'Side', 'Reason', 'Frac', 'Entry_cum_pct', 'Exit_cum_pct', 'PnL_pct', 'PnL_$', 'Remaining'];
+  const labels = {{
+    DT: 'Fill time (ET)',
+    Side: 'Side',
+    Reason: 'Reason',
+    Frac: 'Frac',
+    Entry_cum_pct: 'Entry cum %',
+    Exit_cum_pct: 'Exit cum %',
+    PnL_pct: 'PnL %',
+    'PnL_$': 'PnL $',
+    Remaining: 'Remaining',
+  }};
+
+  let html = '<table class="data-table"><thead><tr>';
+  for (const c of cols) html += '<th>' + labels[c] + '</th>';
+  html += '</tr></thead><tbody>';
+  for (const r of rows) {{
+    html += '<tr>';
+    for (const c of cols) {{
+      let v = r[c];
+      if (c === 'PnL_$' && typeof v === 'number') v = v.toFixed(2);
+      html += '<td>' + v + '</td>';
+    }}
+    html += '</tr>';
+  }}
+  html += '</tbody></table>';
+  panel.innerHTML = html;
+}}
+
+function selectDailyRow(td) {{
+  document.querySelectorAll('.daily-row').forEach(tr => {{
+    tr.classList.toggle('selected', tr.dataset.td === String(td));
+  }});
+  renderFills(td);
+  document.getElementById('fills-panel').scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+}}
+
+document.querySelectorAll('.daily-row').forEach(tr => {{
+  tr.addEventListener('click', () => selectDailyRow(tr.dataset.td));
+  tr.addEventListener('keydown', e => {{
+    if (e.key === 'Enter' || e.key === ' ') {{
+      e.preventDefault();
+      selectDailyRow(tr.dataset.td);
+    }}
+  }});
+}});
+
+const chartEl = document.getElementById('pnl-chart');
+if (chartEl) {{
+  chartEl.on('plotly_click', ev => {{
+    if (!ev.points || !ev.points.length) return;
+    const x = ev.points[0].x;
+    if (!x) return;
+    const d = new Date(x);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const td = String(y) + m + day;
+    selectDailyRow(td);
+  }});
+}}
+
+if (Object.keys(TD_LABELS).length) {{
+  const firstTd = Object.keys(TD_LABELS).sort().pop();
+  selectDailyRow(firstTd);
+}}
+</script>
 </body></html>"""
 
 
