@@ -12,9 +12,10 @@ Daily overreaction backtests.
   ``beta`` (default): SELL/BUY A plus opposite β_trade×B ($10k / $10k×β).
   ``equal``: dollar-neutral — $10k on **both** legs (no β sizing).
 
-Enter 9:30; hold up to ``--max-hold-days`` (default 3). Exit at **EOD** if profitable
-(any day incl. entry day), else exit at close of last hold day. Session loss cap
-still applies intraday.
+Enter 9:30; hold up to ``--max-hold-days`` (default 3). Intraday **take profit** when
+return reaches ``--take-profit-pct`` (default 1%% on $10k notional). Also exit at
+**EOD** if profitable (any day incl. entry day), else close of last hold day. Session
+loss cap still applies intraday.
 
 Usage::
 
@@ -56,6 +57,7 @@ class DailyOverreactParams:
     trade_mode: str = "surprise"  # "surprise" | "quadrant"
     hedge_style: str = "beta"  # "beta" | "equal" (quadrant spread legs only)
     max_hold_days: int = 3
+    take_profit_pct: float = 1.0
     take_profit_eod: bool = True
 
 
@@ -231,6 +233,12 @@ def _position_pnl_usd(
     mark_price: float,
 ) -> float:
     return _leg_breakdown(side, notional, ticker, entry_price, mark_price)["PnL_usd"]
+
+
+def _take_profit_usd(notional: float, take_profit_pct: float) -> float | None:
+    if take_profit_pct <= 0:
+        return None
+    return notional * take_profit_pct / 100.0
 
 
 def _cap_session_pnl(session_pnl: float, raw_pnl: float, max_session_loss: float) -> float:
@@ -474,11 +482,14 @@ def _resolve_hold_exit_single(
     entry_dt: pd.Timestamp,
     entry_price: float,
     max_hold_days: int,
+    take_profit_pct: float,
     take_profit_eod: bool,
 ) -> dict | None:
-    """Up to ``max_hold_days`` sessions; take profit at any EOD close if PnL > 0."""
+    """Up to ``max_hold_days`` sessions; intraday TP and optional EOD profit exit."""
     if not hold_dates:
         return None
+
+    tp_usd = _take_profit_usd(notional, take_profit_pct)
 
     for day_idx, td in enumerate(hold_dates):
         day = panel.loc[panel["Trading date"] == td].sort_values("DT")
@@ -493,6 +504,19 @@ def _resolve_hold_exit_single(
             unrealized = _position_pnl_usd(
                 side, notional, trade_ticker, entry_price, mark
             )
+            if tp_usd is not None and unrealized >= tp_usd:
+                legs = _leg_breakdown(
+                    side, notional, trade_ticker, entry_price, mark
+                )
+                return {
+                    "exit_td": td,
+                    "exit_dt": bar["DT"],
+                    "exit_price": mark,
+                    "exit_reason": f"Take profit {take_profit_pct:g}%",
+                    "hold_days": day_idx + 1,
+                    "legs": legs,
+                    "pnl_usd": legs["PnL_usd"],
+                }
             if max_session_loss > 0 and unrealized <= -max_session_loss:
                 capped = _cap_session_pnl(0.0, unrealized, max_session_loss)
                 legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
@@ -551,10 +575,13 @@ def _resolve_hold_exit_spread(
     entry_pb: float,
     hedge_style: str,
     max_hold_days: int,
+    take_profit_pct: float,
     take_profit_eod: bool,
 ) -> dict | None:
     if not hold_dates:
         return None
+
+    tp_usd = _take_profit_usd(notional, take_profit_pct)
 
     for day_idx, td in enumerate(hold_dates):
         day = panel.loc[panel["Trading date"] == td].sort_values("DT")
@@ -571,6 +598,21 @@ def _resolve_hold_exit_spread(
                 side, notional, beta, ticker_a, ticker_b,
                 entry_pa, entry_pb, pa, pb, hedge_style=hedge_style,
             )
+            if tp_usd is not None and unrealized >= tp_usd:
+                legs = _spread_leg_breakdown(
+                    side, notional, beta, ticker_a, ticker_b,
+                    entry_pa, entry_pb, pa, pb, hedge_style=hedge_style,
+                )
+                return {
+                    "exit_td": td,
+                    "exit_dt": bar["DT"],
+                    "exit_pa": pa,
+                    "exit_pb": pb,
+                    "exit_reason": f"Take profit {take_profit_pct:g}%",
+                    "hold_days": day_idx + 1,
+                    "legs": legs,
+                    "pnl_usd": legs["PnL_usd"],
+                }
             if max_session_loss > 0 and unrealized <= -max_session_loss:
                 capped = _cap_session_pnl(0.0, unrealized, max_session_loss)
                 legs = _spread_leg_breakdown(
@@ -705,6 +747,7 @@ def run_backtest(
                 entry_pb=entry["entry_pb"],
                 hedge_style=p.hedge_style,
                 max_hold_days=p.max_hold_days,
+                take_profit_pct=p.take_profit_pct,
                 take_profit_eod=p.take_profit_eod,
             )
             beta_entry = beta_trade
@@ -723,6 +766,7 @@ def run_backtest(
                 entry_dt=entry["entry_dt"],
                 entry_price=entry["entry_price"],
                 max_hold_days=p.max_hold_days,
+                take_profit_pct=p.take_profit_pct,
                 take_profit_eod=p.take_profit_eod,
             )
             beta_entry = float(row["beta_signal"])
@@ -865,9 +909,15 @@ def summary_stats(
         ("Entry", "9:30 open"),
         (
             "Exit",
-            f"Profit EOD any day (≤{p.max_hold_days}d) or max hold {p.max_hold_days}d close",
+            (
+                f"TP {p.take_profit_pct:g}% intraday; "
+                f"profit EOD any day (≤{p.max_hold_days}d) or max hold {p.max_hold_days}d close"
+                if p.take_profit_pct > 0
+                else f"Profit EOD any day (≤{p.max_hold_days}d) or max hold {p.max_hold_days}d close"
+            ),
         ),
         ("Max hold (sessions)", p.max_hold_days),
+        ("Take profit (%)", p.take_profit_pct if p.take_profit_pct > 0 else "off"),
         ("Take profit EOD", "yes" if p.take_profit_eod else "no"),
         ("Max session loss ($)", p.max_session_loss if p.max_session_loss > 0 else "off"),
         (
@@ -1022,6 +1072,21 @@ def _trades_by_exit_json(trades_df: pd.DataFrame) -> str:
     return json.dumps(grouped)
 
 
+def _exit_explainer(p: DailyOverreactParams) -> str:
+    parts: list[str] = []
+    if p.take_profit_pct > 0:
+        parts.append(
+            f"TP +{p.take_profit_pct:g}% intraday "
+            f"(${p.notional * p.take_profit_pct / 100:,.0f} on ${p.notional:,.0f})"
+        )
+    if p.take_profit_eod:
+        parts.append(f"profit at EOD any day (≤{p.max_hold_days} sessions)")
+    parts.append(f"close day {p.max_hold_days} if still open")
+    if p.max_session_loss > 0:
+        parts.append(f"loss cap −${p.max_session_loss:.0f} intraday")
+    return f"Exit: {'; '.join(parts)}."
+
+
 def build_report_html(
     summary: pd.DataFrame,
     trades_df: pd.DataFrame,
@@ -1076,8 +1141,7 @@ def build_report_html(
         f"surprise &lt; −{p.threshold_pct}% → <strong>long {ticker_a}</strong> "
         f"(mean-revert).<br>"
         f"${p.notional:,.0f} single leg.<br>"
-        f"Exit: profit at EOD any day (≤{p.max_hold_days} sessions) or "
-        f"close day {p.max_hold_days}; loss cap −${p.max_session_loss:.0f} intraday."
+        + _exit_explainer(p)
         if p.trade_mode == "surprise"
         else (
             f"<strong>Large spread</strong> (&gt; +{p.threshold_pct}%): <strong>short spread</strong><br>"
@@ -1091,8 +1155,7 @@ def build_report_html(
                     f"(β_trade day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}).<br>"
                 )
             )
-            + f"Exit: profit at EOD any day (≤{p.max_hold_days} sessions) or "
-            f"close day {p.max_hold_days}; loss cap −${p.max_session_loss:.0f} intraday."
+            + _exit_explainer(p)
         )
     )
 
@@ -1269,6 +1332,12 @@ def _parse_args() -> argparse.Namespace:
         help="Max sessions to hold; exit at EOD if profitable on any day",
     )
     p.add_argument(
+        "--take-profit-pct",
+        type=float,
+        default=1.0,
+        help="Intraday take profit when return on notional reaches this %% (0 = off)",
+    )
+    p.add_argument(
         "--no-take-profit-eod",
         action="store_true",
         help="Disable profit-taking at EOD; only exit on max hold or loss cap",
@@ -1296,6 +1365,7 @@ def main() -> None:
         trade_mode=args.trade_mode,
         hedge_style=args.hedge_style,
         max_hold_days=args.max_hold_days,
+        take_profit_pct=args.take_profit_pct,
         take_profit_eod=not args.no_take_profit_eod,
     )
 
