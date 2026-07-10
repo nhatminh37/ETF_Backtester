@@ -8,10 +8,9 @@ Daily overreaction backtests.
   Trade next day if |surprise| > threshold (mean-revert on PAAS):
     surprise > +threshold → short PAAS;  surprise < −threshold → long PAAS.
 
-**quadrant** — spread size × PAAS direction → **β-hedged spread**:
-  large spread → short spread (SELL A, BUY β_trade×B);
-  small spread → long spread (BUY A, SELL β_trade×B).
-  β_trade from day −20…−1; $10k on A, $10k×β_trade on B.
+**quadrant** — spread size × PAAS direction → hedged spread (``--hedge-style``):
+  ``beta`` (default): SELL/BUY A plus opposite β_trade×B ($10k / $10k×β).
+  ``equal``: dollar-neutral — $10k on **both** legs (no β sizing).
 
 Enter 9:30; exit EOD or session loss cap (``--max-session-loss``; does **not**
 change how many signals fire — only when the position is closed).
@@ -19,7 +18,7 @@ change how many signals fire — only when the position is closed).
 Usage::
 
     python backtest_daily_overreact.py --trade-mode surprise --threshold 3.0
-    python backtest_daily_overreact.py --trade-mode quadrant --start 20230101 --end 20251231
+    python backtest_daily_overreact.py --trade-mode quadrant --hedge-style equal
 """
 
 from __future__ import annotations
@@ -54,6 +53,11 @@ class DailyOverreactParams:
     notional: float = 10_000.0
     max_session_loss: float = 100.0
     trade_mode: str = "surprise"  # "surprise" | "quadrant"
+    hedge_style: str = "beta"  # "beta" | "equal" (quadrant spread legs only)
+
+
+def _b_leg_notional(notional: float, beta: float, hedge_style: str) -> float:
+    return notional if hedge_style == "equal" else notional * beta
 
 
 def _spread_leg_breakdown(
@@ -66,10 +70,12 @@ def _spread_leg_breakdown(
     price_b_entry: float,
     price_a_exit: float,
     price_b_exit: float,
+    *,
+    hedge_style: str = "beta",
 ) -> dict:
-    """β-hedged spread: long = BUY A + SELL β×B; short = SELL A + BUY β×B."""
+    """Spread legs: long = BUY A + SELL B; short = SELL A + BUY B (B sized by hedge_style)."""
     n_a = notional
-    n_b = notional * beta
+    n_b = _b_leg_notional(notional, beta, hedge_style)
     sh_a = n_a / price_a_entry if price_a_entry else 0.0
     sh_b = n_b / price_b_entry if price_b_entry else 0.0
 
@@ -97,7 +103,8 @@ def _spread_leg_breakdown(
                 "Leg": ticker_b,
                 "Action": entry_b_action,
                 "Price": round(price_b_entry, 4),
-                "Beta": round(beta, 4),
+                "Hedge": hedge_style,
+                "Beta": round(beta, 4) if hedge_style == "beta" else None,
                 "Notional_usd": round(n_b, 2),
                 "Shares": round(sh_b, 4),
             },
@@ -134,6 +141,8 @@ def _spread_position_pnl_usd(
     entry_pb: float,
     mark_pa: float,
     mark_pb: float,
+    *,
+    hedge_style: str = "beta",
 ) -> float:
     return _spread_leg_breakdown(
         side,
@@ -145,6 +154,7 @@ def _spread_position_pnl_usd(
         entry_pb,
         mark_pa,
         mark_pb,
+        hedge_style=hedge_style,
     )["PnL_usd"]
 
 
@@ -254,12 +264,18 @@ def _paas_direction_label(r_a: float) -> str | None:
     return None
 
 
+def _spread_leg_label(ticker_b: str, hedge_style: str) -> str:
+    return ticker_b if hedge_style == "equal" else f"β×{ticker_b}"
+
+
 def resolve_quadrant_trade(
     diff_ret: float,
     r_a: float,
     threshold: float,
     ticker_a: str,
     ticker_b: str,
+    *,
+    hedge_style: str = "beta",
 ) -> dict | None:
     """
     Map (spread, PAAS direction) → β-hedged spread side and leg labels.
@@ -268,16 +284,19 @@ def resolve_quadrant_trade(
     if paas_dir is None:
         return None
 
+    b_leg = _spread_leg_label(ticker_b, hedge_style)
+
     if diff_ret > threshold:
         spread_regime = "large_spread"
         side = "short"
+        leg_txt = f"SELL {ticker_a}, BUY {b_leg}"
         if paas_dir == "up":
             return {
                 "side": side,
                 "hedge_type": "spread",
                 "trade_ticker": f"{ticker_a}-{ticker_b}",
                 "signal_flag": "large_spread_paas_up",
-                "trade_rule": f"PAAS overbought → short spread: SELL {ticker_a}, BUY β×{ticker_b}",
+                "trade_rule": f"PAAS overbought → short spread: {leg_txt}",
                 "spread_regime": spread_regime,
                 "paas_dir": paas_dir,
             }
@@ -286,7 +305,7 @@ def resolve_quadrant_trade(
             "hedge_type": "spread",
             "trade_ticker": f"{ticker_a}-{ticker_b}",
             "signal_flag": "large_spread_paas_down",
-            "trade_rule": f"SLV oversold → short spread: SELL {ticker_a}, BUY β×{ticker_b}",
+            "trade_rule": f"SLV oversold → short spread: {leg_txt}",
             "spread_regime": spread_regime,
             "paas_dir": paas_dir,
         }
@@ -294,13 +313,14 @@ def resolve_quadrant_trade(
     if diff_ret < -threshold:
         spread_regime = "small_spread"
         side = "long"
+        leg_txt = f"BUY {ticker_a}, SELL {b_leg}"
         if paas_dir == "up":
             return {
                 "side": side,
                 "hedge_type": "spread",
                 "trade_ticker": f"{ticker_a}-{ticker_b}",
                 "signal_flag": "small_spread_paas_up",
-                "trade_rule": f"SLV overbought → long spread: BUY {ticker_a}, SELL β×{ticker_b}",
+                "trade_rule": f"SLV overbought → long spread: {leg_txt}",
                 "spread_regime": spread_regime,
                 "paas_dir": paas_dir,
             }
@@ -309,7 +329,7 @@ def resolve_quadrant_trade(
             "hedge_type": "spread",
             "trade_ticker": f"{ticker_a}-{ticker_b}",
             "signal_flag": "small_spread_paas_down",
-            "trade_rule": f"PAAS oversold → long spread: BUY {ticker_a}, SELL β×{ticker_b}",
+            "trade_rule": f"PAAS oversold → long spread: {leg_txt}",
             "spread_regime": spread_regime,
             "paas_dir": paas_dir,
         }
@@ -359,9 +379,13 @@ def resolve_trade_plan(
     threshold: float,
     ticker_a: str,
     ticker_b: str,
+    *,
+    hedge_style: str = "beta",
 ) -> dict | None:
     if mode == "quadrant":
-        return resolve_quadrant_trade(surprise, r_a, threshold, ticker_a, ticker_b)
+        return resolve_quadrant_trade(
+            surprise, r_a, threshold, ticker_a, ticker_b, hedge_style=hedge_style
+        )
     if mode == "surprise":
         return resolve_surprise_trade(surprise, threshold, ticker_a)
     raise ValueError(f"trade_mode must be 'surprise' or 'quadrant', got {mode!r}")
@@ -456,6 +480,7 @@ def _resolve_intraday_exit_spread(
     entry_dt: pd.Timestamp,
     entry_pa: float,
     entry_pb: float,
+    hedge_style: str = "beta",
 ) -> dict | None:
     day = panel.loc[panel["Trading date"] == td].sort_values("DT")
     if day.empty:
@@ -470,13 +495,15 @@ def _resolve_intraday_exit_spread(
         pa = float(bar[ticker_a])
         pb = float(bar[ticker_b])
         unrealized = _spread_position_pnl_usd(
-            side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb
+            side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb,
+            hedge_style=hedge_style,
         )
         if max_session_loss > 0 and session_pnl + unrealized <= -max_session_loss:
             raw_pnl = unrealized
             capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, max_session_loss)
             legs = _spread_leg_breakdown(
-                side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb
+                side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb,
+                hedge_style=hedge_style,
             )
             reason = "Session loss cap"
             if abs(capped_pnl - raw_pnl) > 1e-9:
@@ -495,7 +522,8 @@ def _resolve_intraday_exit_spread(
     pa = float(close_row[ticker_a])
     pb = float(close_row[ticker_b])
     legs = _spread_leg_breakdown(
-        side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb
+        side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb,
+        hedge_style=hedge_style,
     )
     return {
         "exit_dt": close_row["DT"],
@@ -593,7 +621,8 @@ def run_backtest(
         surprise = float(row["Signal_surprise_pct"]) / 100.0
         r_a = float(row["Signal_r_a_pct"]) / 100.0
         plan = resolve_trade_plan(
-            p.trade_mode, surprise, r_a, thresh, ticker_a, ticker_b
+            p.trade_mode, surprise, r_a, thresh, ticker_a, ticker_b,
+            hedge_style=p.hedge_style,
         )
         if plan is None:
             continue
@@ -618,6 +647,7 @@ def run_backtest(
                 entry_dt=entry["entry_dt"],
                 entry_pa=entry["entry_pa"],
                 entry_pb=entry["entry_pb"],
+                hedge_style=p.hedge_style,
             )
             entry_price = entry["entry_pa"]
             exit_price = exit_px["exit_pa"] if exit_px else float("nan")
@@ -663,6 +693,7 @@ def run_backtest(
             "Beta_trade": round(beta_entry, 4),
             "Side": plan["side"],
             "Hedge_type": hedge_type,
+            "Hedge_style": p.hedge_style if hedge_type == "spread" else "single",
             "Trade_ticker": plan["trade_ticker"],
             "Entry_date": td,
             "Entry_time": pd.Timestamp(entry["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
@@ -741,14 +772,20 @@ def summary_stats(
     )
 
     position_row = (
-        f"β-hedged spread: ${p.notional:,.0f} on {ticker_a}, ${p.notional:,.0f}×β_trade on {ticker_b}"
-        if p.trade_mode == "quadrant"
-        else f"Single leg ${p.notional:,.0f} on {ticker_a}"
+        f"Equal-dollar spread: ${p.notional:,.0f} on {ticker_a} and ${p.notional:,.0f} on {ticker_b}"
+        if p.trade_mode == "quadrant" and p.hedge_style == "equal"
+        else (
+            f"β-hedged spread: ${p.notional:,.0f} on {ticker_a}, "
+            f"${p.notional:,.0f}×β_trade on {ticker_b}"
+            if p.trade_mode == "quadrant"
+            else f"Single leg ${p.notional:,.0f} on {ticker_a}"
+        )
     )
 
     rows = [
         ("Trades", n),
         ("Trade mode", p.trade_mode),
+        ("Hedge style", p.hedge_style if p.trade_mode == "quadrant" else "n/a"),
         ("Long spread", int(((hedge == "spread") & (side == "long")).sum())),
         ("Short spread", int(((hedge == "spread") & (side == "short")).sum())),
         ("Long PAAS (single)", int(((ta == ticker_a) & (side == "long") & (hedge != "spread")).sum())),
@@ -976,12 +1013,18 @@ def build_report_html(
         f"${p.notional:,.0f} single leg; exit EOD or −${p.max_session_loss:.0f} cap."
         if p.trade_mode == "surprise"
         else (
-            f"<strong>Large spread</strong> (&gt; +{p.threshold_pct}%): <strong>short spread</strong> "
-            f"— SELL {ticker_a}, BUY β_trade×{ticker_b}<br>"
-            f"<strong>Small spread</strong> (&lt; −{p.threshold_pct}%): <strong>long spread</strong> "
-            f"— BUY {ticker_a}, SELL β_trade×{ticker_b}<br>"
-            f"β_trade from day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}; "
-            f"${p.notional:,.0f} per leg; exit EOD or −${p.max_session_loss:.0f} cap."
+            f"<strong>Large spread</strong> (&gt; +{p.threshold_pct}%): <strong>short spread</strong><br>"
+            f"<strong>Small spread</strong> (&lt; −{p.threshold_pct}%): <strong>long spread</strong><br>"
+            + (
+                f"Equal hedge: ${p.notional:,.0f} on {ticker_a} and ${p.notional:,.0f} on {ticker_b} (no β).<br>"
+                if p.hedge_style == "equal"
+                else (
+                    f"β hedge: ${p.notional:,.0f} on {ticker_a}, "
+                    f"${p.notional:,.0f}×β_trade on {ticker_b} "
+                    f"(β_trade day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}).<br>"
+                )
+            )
+            + f"Exit EOD or −${p.max_session_loss:.0f} cap."
         )
     )
 
@@ -1139,6 +1182,12 @@ def _parse_args() -> argparse.Namespace:
         "quadrant = spread×PAAS-dir rules",
     )
     p.add_argument(
+        "--hedge-style",
+        choices=("beta", "equal"),
+        default="beta",
+        help="Quadrant spread hedge: 'beta' = $10k×β on B leg; 'equal' = $10k on both legs",
+    )
+    p.add_argument(
         "--threshold",
         type=float,
         default=3.0,
@@ -1166,11 +1215,14 @@ def main() -> None:
         notional=args.notional,
         max_session_loss=args.max_session_loss,
         trade_mode=args.trade_mode,
+        hedge_style=args.hedge_style,
     )
 
     print(
         f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}), "
-        f"mode={params.trade_mode} …"
+        f"mode={params.trade_mode}"
+        + (f", hedge={params.hedge_style}" if params.trade_mode == "quadrant" else "")
+        + " …"
     )
     panel = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
     signals = build_signal_panel(panel, args.ticker_a, args.ticker_b)
