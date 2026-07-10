@@ -12,8 +12,11 @@ Usage::
     # β₂₀ (20-day daily lookback):
     python plot_price_spread.py --start 20250101 --end 20251231 --mode range --beta 20
 
-    # Single session:
+    # Single session (3 panels: vs 9:45, level, β):
     python plot_price_spread.py --start 20250101 --end 20251231 --date 20250910 --mode day --beta D
+
+    # β hedge ratio panel only:
+    python plot_price_spread.py --date 20250910 --mode day --beta 20 --beta-only
 """
 
 from __future__ import annotations
@@ -65,6 +68,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--level-only", action="store_true", help="Only raw spread level panel")
     p.add_argument("--vs-945-only", action="store_true", help="Only vs-9:45 panel")
+    p.add_argument("--beta-only", action="store_true", help="Only chosen β hedge ratio panel")
+    p.add_argument("--no-beta-panel", action="store_true", help="Hide β hedge ratio panel")
     p.add_argument("--height", type=int, default=920)
     p.add_argument("--width", type=int, default=1500)
     return p.parse_args()
@@ -100,8 +105,9 @@ def main() -> None:
         trading_date = None
         print(f"  mode=range, plotting {args.start}–{args.end}")
 
-    show_vs_anchor = not args.level_only
-    show_level = not args.vs_945_only
+    show_vs_anchor = not args.level_only and not args.beta_only
+    show_level = not args.vs_945_only and not args.beta_only
+    show_beta = not args.no_beta_panel and not (args.level_only or args.vs_945_only)
     height = args.height if mode == "day" else max(args.height, 1000)
 
     fig = beta_price_spread_figure(
@@ -112,6 +118,7 @@ def main() -> None:
         trading_date=trading_date,
         show_vs_anchor=show_vs_anchor,
         show_level=show_level,
+        show_beta=show_beta,
         height=height,
         width=args.width,
     )

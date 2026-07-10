@@ -427,6 +427,7 @@ def beta_price_spread_figure(
     trading_date: int | None = None,
     show_vs_anchor: bool = True,
     show_level: bool = True,
+    show_beta: bool = True,
     anchor_label: str = "9:45",
     height: int = 920,
     width: int = 1500,
@@ -489,7 +490,7 @@ def beta_price_spread_figure(
     if line_width is None:
         line_width = 2.8 if n_sessions <= 2 else (1.2 if n_sessions <= 30 else 0.6)
 
-    rows = int(show_vs_anchor) + int(show_level)
+    rows = int(show_vs_anchor) + int(show_level) + int(show_beta)
     if rows == 0:
         show_vs_anchor = True
         rows = 1
@@ -499,13 +500,26 @@ def beta_price_spread_figure(
         titles.append(f"Δ spread from {anchor_label} ($) — {ticker} − {beta_label}×{cmdty}")
     if show_level:
         titles.append(f"Spread level ($) — {ticker} − {beta_label}×{cmdty}")
+    if show_beta:
+        titles.append(f"{beta_label} hedge ratio — {ticker} on {cmdty}")
+
+    row_heights = []
+    if show_vs_anchor:
+        row_heights.append(0.38)
+    if show_level:
+        row_heights.append(0.38)
+    if show_beta:
+        row_heights.append(0.24)
+    total = sum(row_heights)
+    row_heights = [h / total for h in row_heights]
 
     fig = make_subplots(
         rows=rows,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.07,
+        vertical_spacing=0.06,
         subplot_titles=titles,
+        row_heights=row_heights if len(row_heights) > 1 else None,
     )
 
     row = 1
@@ -536,6 +550,23 @@ def beta_price_spread_figure(
             row=row,
             col=1,
         )
+        row += 1
+
+    if show_beta:
+        beta_sub = sub.dropna(subset=[beta_col])
+        fig.add_trace(
+            go.Scatter(
+                x=beta_sub["DT"],
+                y=beta_sub[beta_col],
+                mode="lines",
+                name=beta_label,
+                line=dict(width=line_width, color="#2ca02c"),
+            ),
+            row=row,
+            col=1,
+        )
+
+    plot_height = height + (180 if show_beta and (show_vs_anchor or show_level) else 0)
 
     fig.update_layout(
         title=dict(
@@ -543,19 +574,25 @@ def beta_price_spread_figure(
             font=dict(size=22),
         ),
         template="plotly_white",
-        height=height,
+        height=plot_height,
         width=width,
         font=dict(size=16),
         legend=dict(font=dict(size=14)),
         margin=dict(l=70, r=40, t=90, b=60),
         hovermode="x unified",
     )
-    fig.update_xaxes(title_text="Time (ET)", title_font=dict(size=16), tickfont=dict(size=13))
+    fig.update_xaxes(title_text="Time (ET)", title_font=dict(size=16), tickfont=dict(size=13), row=rows, col=1)
     fig.update_yaxes(title_font=dict(size=16), tickfont=dict(size=13))
+
+    y_row = 1
     if show_vs_anchor:
-        fig.update_yaxes(title_text=f"Δ spread from {anchor_label} ($)", row=1, col=1)
+        fig.update_yaxes(title_text=f"Δ spread from {anchor_label} ($)", row=y_row, col=1)
+        y_row += 1
     if show_level:
-        fig.update_yaxes(title_text="Spread level ($)", row=rows, col=1)
+        fig.update_yaxes(title_text="Spread level ($)", row=y_row, col=1)
+        y_row += 1
+    if show_beta:
+        fig.update_yaxes(title_text=f"{beta_label} (OLS)", row=y_row, col=1)
     return fig
 
 
