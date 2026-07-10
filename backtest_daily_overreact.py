@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-Daily overreaction — quadrant rules on spread × PAAS direction.
+Daily overreaction backtests.
 
-Signal (session *t*, from prior day *t−1*):
-  β_signal = OLS on daily returns *t−21 … t−2*.
-  diff_ret = r_PAAS − β_signal×r_SLV  (yesterday's hedged return).
-  PAAS direction = sign of yesterday's r_PAAS.
+**surprise** (default) — day −1 actual vs expected:
+  expected = β_signal × r_SLV,  actual = r_PAAS  (prior session daily returns).
+  surprise = actual − expected.
+  Trade next day if |surprise| > threshold (mean-revert on PAAS):
+    surprise > +threshold → short PAAS;  surprise < −threshold → long PAAS.
 
-Trade today ($10k single leg, no hedge):
+**quadrant** — spread size × PAAS direction (PAAS or SLV leg).
 
-  **Large spread** (diff_ret > +threshold):
-    PAAS up   → short PAAS  (PAAS overbought)
-    PAAS down → long SLV    (SLV oversold)
-
-  **Small spread** (diff_ret < −threshold):
-    PAAS up   → short SLV   (SLV overbought)
-    PAAS down → long PAAS   (PAAS oversold)
-
-Enter 9:30; exit EOD or −$100 session loss cap.
+Enter 9:30; exit EOD or session loss cap (``--max-session-loss``; does **not**
+change how many signals fire — only when the position is closed).
 
 Usage::
 
-    python backtest_daily_overreact.py --start 20230101 --end 20251231
-    python backtest_daily_overreact.py --threshold 3.0 --notional 10000 --max-session-loss 100
+    python backtest_daily_overreact.py --trade-mode surprise --threshold 3.0
+    python backtest_daily_overreact.py --trade-mode quadrant --start 20230101 --end 20251231
 """
 
 from __future__ import annotations
@@ -54,6 +48,7 @@ class DailyOverreactParams:
     threshold_pct: float = 3.0
     notional: float = 10_000.0
     max_session_loss: float = 100.0
+    trade_mode: str = "surprise"  # "surprise" | "quadrant"
 
 
 def _leg_breakdown(
@@ -199,6 +194,54 @@ def resolve_quadrant_trade(
     return None
 
 
+def resolve_surprise_trade(
+    surprise: float,
+    threshold: float,
+    ticker_a: str,
+) -> dict | None:
+    """
+    Day −1 actual minus expected (β×r_SLV) → mean-revert PAAS next session.
+    """
+    if surprise > threshold:
+        return {
+            "side": "short",
+            "trade_ticker": ticker_a,
+            "signal_flag": "surprise_positive",
+            "spread_regime": "actual_above_expected",
+            "paas_dir": None,
+            "trade_rule": (
+                f"actual > expected by >{threshold * 100:.2f}% → short {ticker_a}"
+            ),
+        }
+    if surprise < -threshold:
+        return {
+            "side": "long",
+            "trade_ticker": ticker_a,
+            "signal_flag": "surprise_negative",
+            "spread_regime": "actual_below_expected",
+            "paas_dir": None,
+            "trade_rule": (
+                f"actual < expected by >{threshold * 100:.2f}% → long {ticker_a}"
+            ),
+        }
+    return None
+
+
+def resolve_trade_plan(
+    mode: str,
+    surprise: float,
+    r_a: float,
+    threshold: float,
+    ticker_a: str,
+    ticker_b: str,
+) -> dict | None:
+    if mode == "quadrant":
+        return resolve_quadrant_trade(surprise, r_a, threshold, ticker_a, ticker_b)
+    if mode == "surprise":
+        return resolve_surprise_trade(surprise, threshold, ticker_a)
+    raise ValueError(f"trade_mode must be 'surprise' or 'quadrant', got {mode!r}")
+
+
 def build_signal_panel(
     panel: pd.DataFrame,
     ticker_a: str,
@@ -229,16 +272,20 @@ def build_signal_panel(
 
         r_a = float(daily_ret.loc[signal_date, ticker_a])
         r_b = float(daily_ret.loc[signal_date, ticker_b])
-        diff_ret = r_a - beta_signal * r_b
+        expected = beta_signal * r_b
+        surprise = r_a - expected
 
         rows.append(
             {
                 "Trading date": td,
                 "Signal_date": signal_date,
                 "beta_signal": float(beta_signal),
+                "Signal_actual_pct": round(r_a * 100, 4),
+                "Signal_expected_pct": round(expected * 100, 4),
+                "Signal_surprise_pct": round(surprise * 100, 4),
                 "Signal_r_a_pct": round(r_a * 100, 4),
                 "Signal_r_b_pct": round(r_b * 100, 4),
-                "Signal_diff_ret_pct": round(diff_ret * 100, 4),
+                "Signal_diff_ret_pct": round(surprise * 100, 4),
                 "Signal_paas_dir": _paas_direction_label(r_a),
             }
         )
@@ -329,9 +376,11 @@ def run_backtest(
     trade_id = 0
 
     for _, row in signals.iterrows():
-        diff = float(row["Signal_diff_ret_pct"]) / 100.0
+        surprise = float(row["Signal_surprise_pct"]) / 100.0
         r_a = float(row["Signal_r_a_pct"]) / 100.0
-        plan = resolve_quadrant_trade(diff, r_a, thresh, ticker_a, ticker_b)
+        plan = resolve_trade_plan(
+            p.trade_mode, surprise, r_a, thresh, ticker_a, ticker_b
+        )
         if plan is None:
             continue
 
@@ -365,8 +414,11 @@ def run_backtest(
                 "Signal_date": int(row["Signal_date"]),
                 "Signal_flag": plan["signal_flag"],
                 "Spread_regime": plan["spread_regime"],
-                "Signal_paas_dir": plan["paas_dir"],
+                "Signal_paas_dir": plan["paas_dir"] or row["Signal_paas_dir"],
                 "Trade_rule": plan["trade_rule"],
+                "Signal_actual_pct": row["Signal_actual_pct"],
+                "Signal_expected_pct": row["Signal_expected_pct"],
+                "Signal_surprise_pct": row["Signal_surprise_pct"],
                 "Signal_diff_ret_pct": row["Signal_diff_ret_pct"],
                 "Beta_signal": round(float(row["beta_signal"]), 4),
                 "Side": plan["side"],
@@ -421,8 +473,23 @@ def summary_stats(
     ta = trades_df["Trade_ticker"]
     side = trades_df["Side"]
 
+    rules_row = (
+        (
+            "Rules",
+            f"surprise > +{p.threshold_pct}% → short {ticker_a}; "
+            f"< −{p.threshold_pct}% → long {ticker_a}",
+        )
+        if p.trade_mode == "surprise"
+        else (
+            "Rules",
+            "large+PAAS↑→short A; large+PAAS↓→long B; "
+            "small+PAAS↑→short B; small+PAAS↓→long A",
+        )
+    )
+
     rows = [
         ("Trades", n),
+        ("Trade mode", p.trade_mode),
         ("Long PAAS", int(((ta == ticker_a) & (side == "long")).sum())),
         ("Short PAAS", int(((ta == ticker_a) & (side == "short")).sum())),
         ("Long SLV", int(((ta == ticker_b) & (side == "long")).sum())),
@@ -434,13 +501,17 @@ def summary_stats(
         ("Best trade ($)", round(trades_df["PnL_$"].max(), 2)),
         ("Worst trade ($)", round(trades_df["PnL_$"].min(), 2)),
         ("Signal β window", f"day −{SIGNAL_BETA_OFFSET_START} … −{SIGNAL_BETA_OFFSET_END}"),
-        ("Signal metric", f"r_{ticker_a} − β_signal×r_{ticker_b} on prior session (%)"),
         (
-            "Rules",
-            "large+PAAS↑→short A; large+PAAS↓→long B; "
-            "small+PAAS↑→short B; small+PAAS↓→long A",
+            "Signal (day −1)",
+            f"actual r_{ticker_a}, expected β×r_{ticker_b}, surprise = actual − expected",
         ),
-        ("Position", f"Single leg ${p.notional:,.0f} on PAAS or SLV"),
+        rules_row,
+        (
+            "Position",
+            f"Single leg ${p.notional:,.0f} on {ticker_a}"
+            if p.trade_mode == "surprise"
+            else f"Single leg ${p.notional:,.0f} on PAAS or SLV",
+        ),
         ("Threshold (%)", f"±{p.threshold_pct}"),
         ("Entry", "9:30 open"),
         ("Exit", "EOD or session loss cap"),
@@ -483,23 +554,39 @@ def _daily_table_html(daily_df: pd.DataFrame) -> str:
     return "".join(parts)
 
 
-def _trades_table_html(trades_df: pd.DataFrame) -> str:
+def _trades_table_html(trades_df: pd.DataFrame, trade_mode: str) -> str:
     if trades_df.empty:
         return "<p>No trades</p>"
-    cols = [
-        "Trade_id",
-        "Signal_date",
-        "Spread_regime",
-        "Signal_paas_dir",
-        "Trade_ticker",
-        "Side",
-        "Trade_rule",
-        "Signal_diff_ret_pct",
-        "Entry_date",
-        "Exit_reason",
-        "Return_pct",
-        "PnL_$",
-    ]
+    if trade_mode == "quadrant":
+        cols = [
+            "Trade_id",
+            "Signal_date",
+            "Spread_regime",
+            "Signal_paas_dir",
+            "Signal_surprise_pct",
+            "Trade_ticker",
+            "Side",
+            "Trade_rule",
+            "Entry_date",
+            "Exit_reason",
+            "Return_pct",
+            "PnL_$",
+        ]
+    else:
+        cols = [
+            "Trade_id",
+            "Signal_date",
+            "Signal_actual_pct",
+            "Signal_expected_pct",
+            "Signal_surprise_pct",
+            "Trade_ticker",
+            "Side",
+            "Trade_rule",
+            "Entry_date",
+            "Exit_reason",
+            "Return_pct",
+            "PnL_$",
+        ]
     parts = [
         "<table id='trades-table' class='data-table interactive-table'>",
         "<thead><tr>",
@@ -513,7 +600,7 @@ def _trades_table_html(trades_df: pd.DataFrame) -> str:
             val = row[c]
             if c == "PnL_$" and pd.notna(val):
                 text = f"{float(val):,.2f}"
-            elif c in ("Signal_diff_ret_pct", "Return_pct") and pd.notna(val):
+            elif c in ("Signal_diff_ret_pct", "Signal_surprise_pct", "Signal_actual_pct", "Signal_expected_pct", "Return_pct") and pd.notna(val):
                 text = f"{float(val):,.4f}"
             else:
                 text = str(val)
@@ -536,6 +623,9 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Spread_regime": row["Spread_regime"],
             "Signal_paas_dir": row["Signal_paas_dir"],
             "Trade_rule": row["Trade_rule"],
+            "Signal_actual_pct": float(row["Signal_actual_pct"]),
+            "Signal_expected_pct": float(row["Signal_expected_pct"]),
+            "Signal_surprise_pct": float(row["Signal_surprise_pct"]),
             "Signal_diff_ret_pct": float(row["Signal_diff_ret_pct"]),
             "Beta_signal": float(row["Beta_signal"]),
             "Side": row["Side"],
@@ -612,6 +702,26 @@ def build_report_html(
         else {}
     )
 
+    explainer = (
+        f"<strong>Signal</strong> (day −1, trade next open):<br>"
+        f"actual = r_{ticker_a}, expected = β_signal×r_{ticker_b}, "
+        f"surprise = actual − expected.<br>"
+        f"surprise &gt; +{p.threshold_pct}% → <strong>short {ticker_a}</strong>; "
+        f"surprise &lt; −{p.threshold_pct}% → <strong>long {ticker_a}</strong> "
+        f"(mean-revert).<br>"
+        f"${p.notional:,.0f} single leg; exit EOD or −${p.max_session_loss:.0f} cap."
+        if p.trade_mode == "surprise"
+        else (
+            f"<strong>Signal</strong> (prior session): surprise = r_{ticker_a} − β_signal×r_{ticker_b}; "
+            f"PAAS direction = sign(r_{ticker_a}).<br>"
+            f"<strong>Large spread</strong> (&gt; +{p.threshold_pct}%): PAAS ↑ → short {ticker_a}; "
+            f"PAAS ↓ → long {ticker_b}<br>"
+            f"<strong>Small spread</strong> (&lt; −{p.threshold_pct}%): PAAS ↑ → short {ticker_b}; "
+            f"PAAS ↓ → long {ticker_a}<br>"
+            f"${p.notional:,.0f} single leg; exit EOD or −${p.max_session_loss:.0f} cap."
+        )
+    )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Daily overreaction backtest</title>
 <style>
@@ -633,16 +743,10 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 <p>Click a row, chart bar, or trade for leg detail.</p>
 {_daily_table_html(daily_df)}
 <h2>All trades</h2>
-{_trades_table_html(trades_df)}
+{_trades_table_html(trades_df, p.trade_mode)}
 <h2 id="legs-title">Trade legs</h2>
 <div id="explainer">
-  <strong>Signal</strong> (prior session): diff_ret = r_{ticker_a} − β_signal×r_{ticker_b};
-  PAAS direction = sign(r_{ticker_a}).<br>
-  <strong>Large spread</strong> (diff_ret &gt; +{p.threshold_pct}%):<br>
-  &nbsp;• PAAS ↑ → <strong>short {ticker_a}</strong> &nbsp;• PAAS ↓ → <strong>long {ticker_b}</strong><br>
-  <strong>Small spread</strong> (diff_ret &lt; −{p.threshold_pct}%):<br>
-  &nbsp;• PAAS ↑ → <strong>short {ticker_b}</strong> &nbsp;• PAAS ↓ → <strong>long {ticker_a}</strong><br>
-  ${p.notional:,.0f} single leg; exit EOD or −${p.max_session_loss:.0f} session cap.
+  {explainer}
 </div>
 <p id="trade-meta">No trade selected.</p>
 <div id="legs-panel"><p>Select a trade above.</p></div>
@@ -671,7 +775,7 @@ function renderTrade(tradeId) {{
   title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' ' + t.Trade_ticker;
   meta.textContent =
     t.Trade_rule + ' | signal ' + t.Signal_date
-    + ' diff_ret ' + t.Signal_diff_ret_pct.toFixed(3) + '% PAAS ' + t.Signal_paas_dir
+    + ' actual ' + t.Signal_actual_pct.toFixed(3) + '% expected ' + t.Signal_expected_pct.toFixed(3) + '% surprise ' + t.Signal_surprise_pct.toFixed(3) + '%'
     + ' | Entry ' + t.Entry_time + ' Exit ' + t.Exit_time
     + ' (' + t.Exit_reason + ')'
     + ' | PnL $' + pnlTotal.toFixed(2);
@@ -758,6 +862,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--start", type=int, default=default_start)
     p.add_argument("--end", type=int, default=default_end)
     p.add_argument(
+        "--trade-mode",
+        choices=("surprise", "quadrant"),
+        default="surprise",
+        help="surprise = actual vs expected on day−1, trade PAAS; "
+        "quadrant = spread×PAAS-dir rules",
+    )
+    p.add_argument(
         "--threshold",
         type=float,
         default=3.0,
@@ -784,9 +895,13 @@ def main() -> None:
         threshold_pct=args.threshold,
         notional=args.notional,
         max_session_loss=args.max_session_loss,
+        trade_mode=args.trade_mode,
     )
 
-    print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}) …")
+    print(
+        f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}), "
+        f"mode={params.trade_mode} …"
+    )
     panel = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
     signals = build_signal_panel(panel, args.ticker_a, args.ticker_b)
     print(f"  {panel['Trading date'].nunique()} sessions, {len(signals)} days with signal betas")
