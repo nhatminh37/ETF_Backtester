@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Daily overreaction mean-reversion on β-hedged session returns.
+Daily overreaction mean-reversion — directional PAAS only (no SLV hedge).
 
 Signal (known before today's open on session *t*):
   1. β_signal = OLS on daily returns from sessions *t−21 … t−2* (20 days, excludes yesterday).
   2. Yesterday (*t−1*) hedged return:
      diff_ret = r_PAAS − β_signal×r_SLV  (close vs prior close).
-  3. **Overreacted** if diff_ret > +threshold → short spread today.
-     **Underreacted** if diff_ret < −threshold → long spread today.
+  3. **Overreacted** if diff_ret > +threshold → **short PAAS** today.
+     **Underreacted** if diff_ret < −threshold → **long PAAS** today.
 
 Execution (session *t*):
-  β_trade = OLS on daily returns *t−20 … t−1* (includes yesterday).
-  Enter **9:30** open; exit **EOD** (last RTH 1-min bar) or when session PnL
-  hits **−$100** loss cap (``--max-session-loss``).
-  $10k PAAS leg; SLV leg sized β_trade at entry.
+  Enter **9:30** open; exit **EOD** or when session PnL hits **−$100** loss cap.
+  **$10k notional on PAAS only** (no β hedge leg).
 
 Usage::
 
@@ -43,8 +41,6 @@ OPEN_MINUTE = 30
 
 SIGNAL_BETA_OFFSET_START = 21  # day -21
 SIGNAL_BETA_OFFSET_END = 2  # day -2 (inclusive)
-TRADE_BETA_OFFSET_START = 20  # day -20
-TRADE_BETA_OFFSET_END = 1  # day -1 (inclusive)
 
 
 @dataclass
@@ -57,80 +53,51 @@ class DailyOverreactParams:
 def _leg_breakdown(
     side: str,
     notional: float,
-    beta_entry: float,
-    price_a_entry: float,
-    price_b_entry: float,
-    price_a_exit: float,
-    price_b_exit: float,
+    ticker: str,
+    price_entry: float,
+    price_exit: float,
 ) -> dict:
-    n_a = notional
-    n_b = notional * beta_entry
-    sh_a = n_a / price_a_entry if price_a_entry else 0.0
-    sh_b = n_b / price_b_entry if price_b_entry else 0.0
+    """Single-leg PAAS book: $notional long or short."""
+    shares = notional / price_entry if price_entry else 0.0
 
     if side == "long":
-        entry_a_action, entry_b_action = "BUY", "SELL"
-        exit_a_action, exit_b_action = "SELL", "BUY"
-        pnl_a = sh_a * (price_a_exit - price_a_entry)
-        pnl_b = sh_b * (price_b_entry - price_b_exit)
+        entry_action, exit_action = "BUY", "SELL"
+        pnl = shares * (price_exit - price_entry)
     else:
-        entry_a_action, entry_b_action = "SELL", "BUY"
-        exit_a_action, exit_b_action = "BUY", "SELL"
-        pnl_a = sh_a * (price_a_entry - price_a_exit)
-        pnl_b = sh_b * (price_b_exit - price_b_entry)
+        entry_action, exit_action = "SELL", "BUY"
+        pnl = shares * (price_entry - price_exit)
 
     return {
         "entry": [
             {
-                "Leg": "A",
-                "Action": entry_a_action,
-                "Price": round(price_a_entry, 4),
-                "Notional_usd": round(n_a, 2),
-                "Shares": round(sh_a, 4),
-            },
-            {
-                "Leg": "B",
-                "Action": entry_b_action,
-                "Price": round(price_b_entry, 4),
-                "Beta_trade": round(beta_entry, 4),
-                "Notional_usd": round(n_b, 2),
-                "Shares": round(sh_b, 4),
+                "Leg": ticker,
+                "Action": entry_action,
+                "Price": round(price_entry, 4),
+                "Notional_usd": round(notional, 2),
+                "Shares": round(shares, 4),
             },
         ],
         "exit": [
             {
-                "Leg": "A",
-                "Action": exit_a_action,
-                "Price": round(price_a_exit, 4),
-                "Notional_usd": round(sh_a * price_a_exit, 2),
-                "Shares": round(sh_a, 4),
-            },
-            {
-                "Leg": "B",
-                "Action": exit_b_action,
-                "Price": round(price_b_exit, 4),
-                "Notional_usd": round(sh_b * price_b_exit, 2),
-                "Shares": round(sh_b, 4),
+                "Leg": ticker,
+                "Action": exit_action,
+                "Price": round(price_exit, 4),
+                "Notional_usd": round(shares * price_exit, 2),
+                "Shares": round(shares, 4),
             },
         ],
-        "PnL_A_usd": round(pnl_a, 2),
-        "PnL_B_usd": round(pnl_b, 2),
-        "PnL_total_usd": round(pnl_a + pnl_b, 2),
+        "PnL_usd": round(pnl, 2),
     }
 
 
 def _position_pnl_usd(
     side: str,
     notional: float,
-    beta: float,
-    entry_pa: float,
-    entry_pb: float,
-    mark_pa: float,
-    mark_pb: float,
+    ticker: str,
+    entry_price: float,
+    mark_price: float,
 ) -> float:
-    return _leg_breakdown(
-        side, notional, beta, entry_pa, entry_pb, mark_pa, mark_pb
-    )["PnL_total_usd"]
+    return _leg_breakdown(side, notional, ticker, entry_price, mark_price)["PnL_usd"]
 
 
 def _cap_session_pnl(session_pnl: float, raw_pnl: float, max_session_loss: float) -> float:
@@ -140,14 +107,22 @@ def _cap_session_pnl(session_pnl: float, raw_pnl: float, max_session_loss: float
 
 
 def _scale_leg_pnl(legs: dict, capped_total: float) -> dict:
-    raw = legs["PnL_total_usd"]
+    raw = legs["PnL_usd"]
     if raw == 0 or abs(raw - capped_total) < 1e-9:
-        return legs
+        out = dict(legs)
+        out["PnL_usd"] = round(capped_total, 2)
+        return out
     scale = capped_total / raw
     out = dict(legs)
-    out["PnL_A_usd"] = round(legs["PnL_A_usd"] * scale, 2)
-    out["PnL_B_usd"] = round(legs["PnL_B_usd"] * scale, 2)
-    out["PnL_total_usd"] = round(capped_total, 2)
+    for leg_list in ("entry", "exit"):
+        scaled_legs = []
+        for leg in legs[leg_list]:
+            item = dict(leg)
+            item["Notional_usd"] = round(item["Notional_usd"] * scale, 2)
+            item["Shares"] = round(item["Shares"] * scale, 4)
+            scaled_legs.append(item)
+        out[leg_list] = scaled_legs
+    out["PnL_usd"] = round(capped_total, 2)
     return out
 
 
@@ -157,7 +132,7 @@ def build_signal_panel(
     ticker_b: str,
 ) -> pd.DataFrame:
     """
-    One row per tradable session with signal + trade betas and yesterday's diff_ret.
+    One row per tradable session with signal beta and yesterday's diff_ret.
     """
     daily_ret = pair_daily_returns(panel, ticker_a, ticker_b)
     if daily_ret is None or daily_ret.empty:
@@ -169,19 +144,14 @@ def build_signal_panel(
     for i in range(SIGNAL_BETA_OFFSET_START, len(dates)):
         td = dates[i]
         signal_beta_dates = dates[i - SIGNAL_BETA_OFFSET_START : i - SIGNAL_BETA_OFFSET_END + 1]
-        trade_beta_dates = dates[i - TRADE_BETA_OFFSET_START : i - TRADE_BETA_OFFSET_END + 1]
         signal_date = dates[i - 1]
 
         if len(signal_beta_dates) != SIGNAL_BETA_OFFSET_START - SIGNAL_BETA_OFFSET_END + 1:
             continue
-        if len(trade_beta_dates) != TRADE_BETA_OFFSET_START - TRADE_BETA_OFFSET_END + 1:
-            continue
 
         win_signal = daily_ret.loc[signal_beta_dates]
-        win_trade = daily_ret.loc[trade_beta_dates]
         beta_signal = ols_beta(win_signal[ticker_a], win_signal[ticker_b])
-        beta_trade = ols_beta(win_trade[ticker_a], win_trade[ticker_b])
-        if pd.isna(beta_signal) or pd.isna(beta_trade):
+        if pd.isna(beta_signal):
             continue
 
         r_a = float(daily_ret.loc[signal_date, ticker_a])
@@ -193,7 +163,6 @@ def build_signal_panel(
                 "Trading date": td,
                 "Signal_date": signal_date,
                 "beta_signal": float(beta_signal),
-                "beta_trade": float(beta_trade),
                 "Signal_r_a_pct": round(r_a * 100, 4),
                 "Signal_r_b_pct": round(r_b * 100, 4),
                 "Signal_diff_ret_pct": round(diff_ret * 100, 4),
@@ -206,7 +175,6 @@ def build_signal_panel(
 def _session_entry(
     panel: pd.DataFrame,
     ticker_a: str,
-    ticker_b: str,
     td: int,
 ) -> dict | None:
     day = panel.loc[panel["Trading date"] == td].sort_values("DT")
@@ -217,24 +185,20 @@ def _session_entry(
     open_row = day.loc[open_mask].iloc[0] if open_mask.any() else day.iloc[0]
     return {
         "entry_dt": open_row["DT"],
-        "entry_pa": float(open_row[ticker_a]),
-        "entry_pb": float(open_row[ticker_b]),
+        "entry_price": float(open_row[ticker_a]),
     }
 
 
 def _resolve_intraday_exit(
     panel: pd.DataFrame,
     ticker_a: str,
-    ticker_b: str,
     td: int,
     *,
     side: str,
-    beta_trade: float,
     notional: float,
     max_session_loss: float,
     entry_dt: pd.Timestamp,
-    entry_pa: float,
-    entry_pb: float,
+    entry_price: float,
 ) -> dict | None:
     """Walk 1-min bars; exit on session loss cap or EOD."""
     day = panel.loc[panel["Trading date"] == td].sort_values("DT")
@@ -247,43 +211,35 @@ def _resolve_intraday_exit(
         return None
 
     for _, bar in after_entry.iterrows():
-        pa = float(bar[ticker_a])
-        pb = float(bar[ticker_b])
+        mark = float(bar[ticker_a])
         unrealized = _position_pnl_usd(
-            side, notional, beta_trade, entry_pa, entry_pb, pa, pb
+            side, notional, ticker_a, entry_price, mark
         )
         if max_session_loss > 0 and session_pnl + unrealized <= -max_session_loss:
             raw_pnl = unrealized
             capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, max_session_loss)
-            legs = _leg_breakdown(
-                side, notional, beta_trade, entry_pa, entry_pb, pa, pb
-            )
+            legs = _leg_breakdown(side, notional, ticker_a, entry_price, mark)
             reason = "Session loss cap"
             if abs(capped_pnl - raw_pnl) > 1e-9:
                 legs = _scale_leg_pnl(legs, capped_pnl)
                 reason = f"{reason} (${max_session_loss:.0f})"
             return {
                 "exit_dt": bar["DT"],
-                "exit_pa": pa,
-                "exit_pb": pb,
+                "exit_price": mark,
                 "exit_reason": reason,
                 "legs": legs,
                 "pnl_usd": capped_pnl,
             }
 
     close_row = day.iloc[-1]
-    pa = float(close_row[ticker_a])
-    pb = float(close_row[ticker_b])
-    legs = _leg_breakdown(
-        side, notional, beta_trade, entry_pa, entry_pb, pa, pb
-    )
+    mark = float(close_row[ticker_a])
+    legs = _leg_breakdown(side, notional, ticker_a, entry_price, mark)
     return {
         "exit_dt": close_row["DT"],
-        "exit_pa": pa,
-        "exit_pb": pb,
+        "exit_price": mark,
         "exit_reason": "EOD",
         "legs": legs,
-        "pnl_usd": legs["PnL_total_usd"],
+        "pnl_usd": legs["PnL_usd"],
     }
 
 
@@ -310,23 +266,19 @@ def run_backtest(
             continue
 
         td = int(row["Trading date"])
-        entry = _session_entry(panel, ticker_a, ticker_b, td)
+        entry = _session_entry(panel, ticker_a, td)
         if entry is None:
             continue
 
-        beta_trade = float(row["beta_trade"])
         exit_px = _resolve_intraday_exit(
             panel,
             ticker_a,
-            ticker_b,
             td,
             side=side,
-            beta_trade=beta_trade,
             notional=p.notional,
             max_session_loss=p.max_session_loss,
             entry_dt=entry["entry_dt"],
-            entry_pa=entry["entry_pa"],
-            entry_pb=entry["entry_pb"],
+            entry_price=entry["entry_price"],
         )
         if exit_px is None:
             continue
@@ -343,21 +295,16 @@ def run_backtest(
                 "Signal_flag": flag,
                 "Signal_diff_ret_pct": row["Signal_diff_ret_pct"],
                 "Beta_signal": round(float(row["beta_signal"]), 4),
-                "Beta_trade": round(beta_trade, 4),
                 "Side": side,
                 "Entry_date": td,
                 "Entry_time": pd.Timestamp(entry["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
                 "Exit_date": td,
                 "Exit_time": pd.Timestamp(exit_px["exit_dt"]).strftime("%Y-%m-%d %H:%M"),
                 "Exit_reason": exit_px["exit_reason"],
-                f"Entry_{ticker_a}": round(entry["entry_pa"], 4),
-                f"Entry_{ticker_b}": round(entry["entry_pb"], 4),
-                f"Exit_{ticker_a}": round(exit_px["exit_pa"], 4),
-                f"Exit_{ticker_b}": round(exit_px["exit_pb"], 4),
+                f"Entry_{ticker_a}": round(entry["entry_price"], 4),
+                f"Exit_{ticker_a}": round(exit_px["exit_price"], 4),
                 "Return_pct": round(return_pct, 4),
                 "PnL_$": round(pnl_usd, 2),
-                "PnL_A_$": legs["PnL_A_usd"],
-                "PnL_B_$": legs["PnL_B_usd"],
                 "_legs": legs,
             }
         )
@@ -398,8 +345,8 @@ def summary_stats(
 
     rows = [
         ("Trades", n),
-        ("Long (underreacted)", int((trades_df["Side"] == "long").sum())),
-        ("Short (overreacted)", int((trades_df["Side"] == "short").sum())),
+        ("Long PAAS (underreacted)", int((trades_df["Side"] == "long").sum())),
+        ("Short PAAS (overreacted)", int((trades_df["Side"] == "short").sum())),
         ("Total PnL ($)", round(total, 2)),
         ("Avg return per trade (%)", round(trades_df["Return_pct"].mean(), 3)),
         ("Avg PnL per trade ($)", round(trades_df["PnL_$"].mean(), 2)),
@@ -407,8 +354,8 @@ def summary_stats(
         ("Best trade ($)", round(trades_df["PnL_$"].max(), 2)),
         ("Worst trade ($)", round(trades_df["PnL_$"].min(), 2)),
         ("Signal β window", f"day −{SIGNAL_BETA_OFFSET_START} … −{SIGNAL_BETA_OFFSET_END}"),
-        ("Trade β window", f"day −{TRADE_BETA_OFFSET_START} … −{TRADE_BETA_OFFSET_END}"),
         ("Signal metric", f"r_{ticker_a} − β_signal×r_{ticker_b} on prior session (%)"),
+        ("Position", f"Directional {ticker_a} only (${p.notional:,.0f}, no {ticker_b} hedge)"),
         ("Threshold (%)", f"±{p.threshold_pct}"),
         ("Entry", "9:30 open"),
         ("Exit", "EOD or session loss cap"),
@@ -417,7 +364,7 @@ def summary_stats(
             "Cap exits",
             int(trades_df["Exit_reason"].astype(str).str.contains("loss cap").sum()),
         ),
-        ("Notional leg A", p.notional),
+        ("Notional", p.notional),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
@@ -461,7 +408,6 @@ def _trades_table_html(trades_df: pd.DataFrame) -> str:
         "Side",
         "Signal_diff_ret_pct",
         "Beta_signal",
-        "Beta_trade",
         "Entry_date",
         "Exit_reason",
         "Return_pct",
@@ -502,7 +448,6 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Signal_flag": row["Signal_flag"],
             "Signal_diff_ret_pct": float(row["Signal_diff_ret_pct"]),
             "Beta_signal": float(row["Beta_signal"]),
-            "Beta_trade": float(row["Beta_trade"]),
             "Side": row["Side"],
             "Entry_date": int(row["Entry_date"]),
             "Entry_time": row["Entry_time"],
@@ -510,15 +455,11 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Exit_time": row["Exit_time"],
             "Exit_reason": row["Exit_reason"],
             f"Entry_{ticker_a}": float(row[f"Entry_{ticker_a}"]),
-            f"Entry_{ticker_b}": float(row[f"Entry_{ticker_b}"]),
             f"Exit_{ticker_a}": float(row[f"Exit_{ticker_a}"]),
-            f"Exit_{ticker_b}": float(row[f"Exit_{ticker_b}"]),
             "Return_pct": float(row["Return_pct"]),
-            "PnL_A_usd": float(row["PnL_A_$"]),
-            "PnL_B_usd": float(row["PnL_B_$"]),
+            "PnL_usd": float(row["PnL_$"]),
             "legs": row["_legs"],
             "ticker_a": ticker_a,
-            "ticker_b": ticker_b,
         }
     return json.dumps(out)
 
@@ -605,9 +546,9 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 <div id="explainer">
   <strong>Signal β</strong> (day −{SIGNAL_BETA_OFFSET_START}…−{SIGNAL_BETA_OFFSET_END}): OLS on daily returns.<br>
   <strong>Yesterday diff_ret</strong> = r_{ticker_a} − β_signal×r_{ticker_b}.<br>
-  <strong>Overreacted</strong> (&gt; +{p.threshold_pct}%): short spread — SELL {ticker_a}, BUY β_trade×{ticker_b}.<br>
-  <strong>Underreacted</strong> (&lt; −{p.threshold_pct}%): long spread — opposite.<br>
-  <strong>Trade β</strong> (day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}) sizes hedge at 9:30.<br>
+  <strong>Overreacted</strong> (&gt; +{p.threshold_pct}%): PAAS rich vs β×{ticker_b} → <strong>SHORT {ticker_a}</strong> ${p.notional:,.0f}.<br>
+  <strong>Underreacted</strong> (&lt; −{p.threshold_pct}%): PAAS cheap → <strong>LONG {ticker_a}</strong> ${p.notional:,.0f}.<br>
+  No SLV hedge leg — directional {ticker_a} only.<br>
   <strong>Exit:</strong> EOD, or intraday if mark-to-market PnL ≤ −${p.max_session_loss:.0f} (``--max-session-loss``).
 </div>
 <p id="trade-meta">No trade selected.</p>
@@ -617,12 +558,11 @@ const TRADES = {_trades_json(trades_df, ticker_a, ticker_b)};
 const TRADES_BY_EXIT = {_trades_by_exit_json(trades_df)};
 const TD_LABELS = {json.dumps(td_dates)};
 
-function legTable(title, timeLabel, legs, tickerA, tickerB) {{
+function legTable(title, timeLabel, legs) {{
   let html = '<h3>' + title + ' (' + timeLabel + ')</h3>';
-  html += '<table class="data-table"><thead><tr><th>Leg</th><th>Action</th><th>Price</th><th>Notional $</th><th>Shares</th></tr></thead><tbody>';
+  html += '<table class="data-table"><thead><tr><th>Ticker</th><th>Action</th><th>Price</th><th>Notional $</th><th>Shares</th></tr></thead><tbody>';
   for (const leg of legs) {{
-    const name = leg.Leg === 'A' ? tickerA : tickerB;
-    html += '<tr><td>' + name + '</td><td>' + leg.Action + '</td><td>' + leg.Price + '</td><td>' + leg.Notional_usd + '</td><td>' + leg.Shares + '</td></tr>';
+    html += '<tr><td>' + leg.Leg + '</td><td>' + leg.Action + '</td><td>' + leg.Price + '</td><td>' + leg.Notional_usd + '</td><td>' + leg.Shares + '</td></tr>';
   }}
   html += '</tbody></table>';
   return html;
@@ -634,20 +574,18 @@ function renderTrade(tradeId) {{
   const title = document.getElementById('legs-title');
   const meta = document.getElementById('trade-meta');
   const panel = document.getElementById('legs-panel');
-  const pnlTotal = t.PnL_A_usd + t.PnL_B_usd;
-  title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' (' + t.Signal_flag + ')';
+  const pnlTotal = t.PnL_usd;
+  title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' ' + t.ticker_a + ' (' + t.Signal_flag + ')';
   meta.textContent =
     'Signal ' + t.Signal_date + ' diff_ret ' + t.Signal_diff_ret_pct.toFixed(3) + '%'
-    + ' | β_signal ' + t.Beta_signal + ' β_trade ' + t.Beta_trade
+    + ' | β_signal ' + t.Beta_signal
     + ' | Entry ' + t.Entry_time + ' Exit ' + t.Exit_time
     + ' (' + t.Exit_reason + ')'
     + ' | PnL $' + pnlTotal.toFixed(2);
 
-  let html = legTable('Entry legs', t.Entry_time, t.legs.entry, t.ticker_a, t.ticker_b);
-  html += legTable('Exit legs', t.Exit_time, t.legs.exit, t.ticker_a, t.ticker_b);
-  html += '<table class="data-table"><thead><tr><th>Leg PnL</th><th>$</th></tr></thead><tbody>';
-  html += '<tr><td>' + t.ticker_a + '</td><td>' + t.PnL_A_usd.toFixed(2) + '</td></tr>';
-  html += '<tr><td>' + t.ticker_b + ' (hedge)</td><td>' + t.PnL_B_usd.toFixed(2) + '</td></tr>';
+  let html = legTable('Entry', t.Entry_time, t.legs.entry);
+  html += legTable('Exit', t.Exit_time, t.legs.exit);
+  html += '<table class="data-table"><thead><tr><th>PnL</th><th>$</th></tr></thead><tbody>';
   html += '<tr><td><b>Total</b></td><td><b>' + pnlTotal.toFixed(2) + '</b></td></tr>';
   html += '</tbody></table>';
   panel.innerHTML = html;
@@ -675,7 +613,7 @@ function selectDailyRow(td) {{
     let html = '<ul>';
     ids.forEach(id => {{
       const t = TRADES[String(id)];
-      html += '<li><a href="#" data-trade="' + id + '">#' + id + ' ' + t.Side + ' PnL $' + (t.PnL_A_usd + t.PnL_B_usd).toFixed(2) + '</a></li>';
+      html += '<li><a href="#" data-trade="' + id + '">#' + id + ' ' + t.Side + ' PnL $' + t.PnL_usd.toFixed(2) + '</a></li>';
     }});
     html += '</ul>';
     document.getElementById('legs-panel').innerHTML = html;
@@ -720,7 +658,7 @@ def _parse_args() -> argparse.Namespace:
     default_start = int((today - timedelta(days=365 * 2)).strftime("%Y%m%d"))
 
     p = argparse.ArgumentParser(
-        description="Daily overreaction: prior-day hedged return signal, open-to-EOD trade."
+        description="Daily overreaction: directional PAAS signal, open-to-EOD trade."
     )
     p.add_argument("--ticker-a", default="PAAS")
     p.add_argument("--ticker-b", default="SLV")
