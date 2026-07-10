@@ -418,6 +418,34 @@ def attach_beta_d_price_spread(
     )
 
 
+def _map_session_beta_ma(
+    sub: pd.DataFrame,
+    beta_col: str,
+    windows: list[int],
+) -> pd.DataFrame:
+    """Rolling mean of per-session β over prior sessions (inclusive)."""
+    if not windows:
+        return sub
+
+    daily = (
+        sub.groupby("Trading date", as_index=False)[beta_col]
+        .first()
+        .sort_values("Trading date")
+    )
+    for w in windows:
+        ma_col = f"_beta_ma{w}"
+        daily[ma_col] = daily[beta_col].rolling(window=w, min_periods=1).mean()
+
+    lut = daily.set_index("Trading date")
+    out = sub.copy()
+    for w in windows:
+        out[f"_beta_ma{w}"] = out["Trading date"].map(lut[f"_beta_ma{w}"])
+    return out
+
+
+_BETA_MA_COLORS = ("#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#17becf")
+
+
 def beta_price_spread_figure(
     df: pd.DataFrame,
     ticker: str,
@@ -428,6 +456,7 @@ def beta_price_spread_figure(
     show_vs_anchor: bool = True,
     show_level: bool = True,
     show_beta: bool = True,
+    beta_ma_windows: list[int] | None = None,
     anchor_label: str = "9:45",
     height: int = 920,
     width: int = 1500,
@@ -437,6 +466,7 @@ def beta_price_spread_figure(
     Large Plotly chart for β dollar price spread (1-min RTH).
 
     ``beta``: ``"20"`` (20-day daily) or ``"D"`` (prior session 15m).
+    ``beta_ma_windows``: session rolling means on β panel (e.g. [5, 10, 20]).
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -501,7 +531,9 @@ def beta_price_spread_figure(
     if show_level:
         titles.append(f"Spread level ($) — {ticker} − {beta_label}×{cmdty}")
     if show_beta:
-        titles.append(f"{beta_label} hedge ratio — {ticker} on {cmdty}")
+        ma_windows = beta_ma_windows if beta_ma_windows is not None else [5, 10, 20]
+        ma_tag = f" + MA{','.join(str(w) for w in ma_windows)}" if ma_windows else ""
+        titles.append(f"{beta_label} hedge ratio{ma_tag} — {ticker} on {cmdty}")
 
     row_heights = []
     if show_vs_anchor:
@@ -553,18 +585,38 @@ def beta_price_spread_figure(
         row += 1
 
     if show_beta:
-        beta_sub = sub.dropna(subset=[beta_col])
+        ma_windows = beta_ma_windows if beta_ma_windows is not None else [5, 10, 20]
+        beta_sub = _map_session_beta_ma(
+            sub.dropna(subset=[beta_col]), beta_col, ma_windows
+        )
         fig.add_trace(
             go.Scatter(
                 x=beta_sub["DT"],
                 y=beta_sub[beta_col],
                 mode="lines",
-                name=beta_label,
+                name=f"{beta_label} (daily)",
                 line=dict(width=line_width, color="#2ca02c"),
             ),
             row=row,
             col=1,
         )
+        ma_width = max(1.0, line_width * 0.85)
+        for i, w in enumerate(ma_windows):
+            ma_col = f"_beta_ma{w}"
+            if ma_col not in beta_sub.columns:
+                continue
+            color = _BETA_MA_COLORS[i % len(_BETA_MA_COLORS)]
+            fig.add_trace(
+                go.Scatter(
+                    x=beta_sub["DT"],
+                    y=beta_sub[ma_col],
+                    mode="lines",
+                    name=f"{beta_label} MA{w} (sessions)",
+                    line=dict(width=ma_width, color=color, dash="dash"),
+                ),
+                row=row,
+                col=1,
+            )
 
     plot_height = height + (180 if show_beta and (show_vs_anchor or show_level) else 0)
 

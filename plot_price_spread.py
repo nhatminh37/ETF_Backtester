@@ -15,8 +15,11 @@ Usage::
     # Single session (3 panels: vs 9:45, level, β):
     python plot_price_spread.py --start 20250101 --end 20251231 --date 20250910 --mode day --beta D
 
-    # β hedge ratio panel only:
-    python plot_price_spread.py --date 20250910 --mode day --beta 20 --beta-only
+    # β panel with session MA5/10/20 (default):
+    python plot_price_spread.py --date 20250910 --mode day --beta 20 --beta-ma 5,10,20
+
+    # Raw β only (no moving averages):
+    python plot_price_spread.py --date 20250910 --mode day --beta D --beta-ma ""
 """
 
 from __future__ import annotations
@@ -34,6 +37,15 @@ from silver_backtesting.spread import (
     attach_beta_d_price_spread,
     beta_price_spread_figure,
 )
+
+
+def _parse_beta_ma_windows(raw: str | None) -> list[int]:
+    if raw is None:
+        return [5, 10, 20]
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return []
+    return [int(p) for p in parts]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -70,6 +82,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vs-945-only", action="store_true", help="Only vs-9:45 panel")
     p.add_argument("--beta-only", action="store_true", help="Only chosen β hedge ratio panel")
     p.add_argument("--no-beta-panel", action="store_true", help="Hide β hedge ratio panel")
+    p.add_argument(
+        "--beta-ma",
+        default="5,10,20",
+        help="Session rolling means on β panel, comma-separated (e.g. 5,10,20). Empty = off",
+    )
     p.add_argument("--height", type=int, default=920)
     p.add_argument("--width", type=int, default=1500)
     return p.parse_args()
@@ -108,6 +125,7 @@ def main() -> None:
     show_vs_anchor = not args.level_only and not args.beta_only
     show_level = not args.vs_945_only and not args.beta_only
     show_beta = not args.no_beta_panel and not (args.level_only or args.vs_945_only)
+    beta_ma_windows = _parse_beta_ma_windows(args.beta_ma) if show_beta else []
     height = args.height if mode == "day" else max(args.height, 1000)
 
     fig = beta_price_spread_figure(
@@ -119,6 +137,7 @@ def main() -> None:
         show_vs_anchor=show_vs_anchor,
         show_level=show_level,
         show_beta=show_beta,
+        beta_ma_windows=beta_ma_windows,
         height=height,
         width=args.width,
     )
