@@ -12,8 +12,9 @@ Daily overreaction backtests.
   ``beta`` (default): SELL/BUY A plus opposite β_trade×B ($10k / $10k×β).
   ``equal``: dollar-neutral — $10k on **both** legs (no β sizing).
 
-Enter 9:30; exit EOD or session loss cap (``--max-session-loss``; does **not**
-change how many signals fire — only when the position is closed).
+Enter 9:30; hold up to ``--max-hold-days`` (default 3). Exit at **EOD** if profitable
+(any day incl. entry day), else exit at close of last hold day. Session loss cap
+still applies intraday.
 
 Usage::
 
@@ -54,6 +55,8 @@ class DailyOverreactParams:
     max_session_loss: float = 100.0
     trade_mode: str = "surprise"  # "surprise" | "quadrant"
     hedge_style: str = "beta"  # "beta" | "equal" (quadrant spread legs only)
+    max_hold_days: int = 3
+    take_profit_eod: bool = True
 
 
 def _b_leg_notional(notional: float, beta: float, hedge_style: str) -> float:
@@ -448,6 +451,178 @@ def build_signal_panel(
     return pd.DataFrame(rows).sort_values("Trading date").reset_index(drop=True)
 
 
+def _sorted_trading_dates(panel: pd.DataFrame) -> list[int]:
+    return sorted(int(d) for d in panel["Trading date"].unique())
+
+
+def _hold_dates(panel: pd.DataFrame, entry_td: int, max_hold_days: int) -> list[int]:
+    dates = _sorted_trading_dates(panel)
+    if entry_td not in dates:
+        return []
+    start = dates.index(entry_td)
+    return dates[start : start + max_hold_days]
+
+
+def _resolve_hold_exit_single(
+    panel: pd.DataFrame,
+    trade_ticker: str,
+    hold_dates: list[int],
+    *,
+    side: str,
+    notional: float,
+    max_session_loss: float,
+    entry_dt: pd.Timestamp,
+    entry_price: float,
+    max_hold_days: int,
+    take_profit_eod: bool,
+) -> dict | None:
+    """Up to ``max_hold_days`` sessions; take profit at any EOD close if PnL > 0."""
+    if not hold_dates:
+        return None
+
+    for day_idx, td in enumerate(hold_dates):
+        day = panel.loc[panel["Trading date"] == td].sort_values("DT")
+        if day.empty or trade_ticker not in day.columns:
+            return None
+
+        is_entry_day = day_idx == 0
+        bars = day.loc[day["DT"] >= entry_dt] if is_entry_day else day
+
+        for _, bar in bars.iterrows():
+            mark = float(bar[trade_ticker])
+            unrealized = _position_pnl_usd(
+                side, notional, trade_ticker, entry_price, mark
+            )
+            if max_session_loss > 0 and unrealized <= -max_session_loss:
+                capped = _cap_session_pnl(0.0, unrealized, max_session_loss)
+                legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
+                reason = "Session loss cap"
+                if abs(capped - unrealized) > 1e-9:
+                    legs = _scale_leg_pnl(legs, capped)
+                    reason = f"{reason} (${max_session_loss:.0f})"
+                return {
+                    "exit_td": td,
+                    "exit_dt": bar["DT"],
+                    "exit_price": mark,
+                    "exit_reason": reason,
+                    "hold_days": day_idx + 1,
+                    "legs": legs,
+                    "pnl_usd": capped,
+                }
+
+        close_row = day.iloc[-1]
+        mark = float(close_row[trade_ticker])
+        legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
+        pnl = legs["PnL_usd"]
+        is_last_day = day_idx == len(hold_dates) - 1
+
+        if take_profit_eod and pnl > 0:
+            reason = f"Profit EOD (day {day_idx + 1})"
+        elif is_last_day:
+            reason = f"Max hold {max_hold_days}d"
+        else:
+            continue
+
+        return {
+            "exit_td": td,
+            "exit_dt": close_row["DT"],
+            "exit_price": mark,
+            "exit_reason": reason,
+            "hold_days": day_idx + 1,
+            "legs": legs,
+            "pnl_usd": pnl,
+        }
+
+    return None
+
+
+def _resolve_hold_exit_spread(
+    panel: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    hold_dates: list[int],
+    *,
+    side: str,
+    beta: float,
+    notional: float,
+    max_session_loss: float,
+    entry_dt: pd.Timestamp,
+    entry_pa: float,
+    entry_pb: float,
+    hedge_style: str,
+    max_hold_days: int,
+    take_profit_eod: bool,
+) -> dict | None:
+    if not hold_dates:
+        return None
+
+    for day_idx, td in enumerate(hold_dates):
+        day = panel.loc[panel["Trading date"] == td].sort_values("DT")
+        if day.empty:
+            return None
+
+        is_entry_day = day_idx == 0
+        bars = day.loc[day["DT"] >= entry_dt] if is_entry_day else day
+
+        for _, bar in bars.iterrows():
+            pa = float(bar[ticker_a])
+            pb = float(bar[ticker_b])
+            unrealized = _spread_position_pnl_usd(
+                side, notional, beta, ticker_a, ticker_b,
+                entry_pa, entry_pb, pa, pb, hedge_style=hedge_style,
+            )
+            if max_session_loss > 0 and unrealized <= -max_session_loss:
+                capped = _cap_session_pnl(0.0, unrealized, max_session_loss)
+                legs = _spread_leg_breakdown(
+                    side, notional, beta, ticker_a, ticker_b,
+                    entry_pa, entry_pb, pa, pb, hedge_style=hedge_style,
+                )
+                reason = "Session loss cap"
+                if abs(capped - unrealized) > 1e-9:
+                    legs = _scale_spread_leg_pnl(legs, capped)
+                    reason = f"{reason} (${max_session_loss:.0f})"
+                return {
+                    "exit_td": td,
+                    "exit_dt": bar["DT"],
+                    "exit_pa": pa,
+                    "exit_pb": pb,
+                    "exit_reason": reason,
+                    "hold_days": day_idx + 1,
+                    "legs": legs,
+                    "pnl_usd": capped,
+                }
+
+        close_row = day.iloc[-1]
+        pa = float(close_row[ticker_a])
+        pb = float(close_row[ticker_b])
+        legs = _spread_leg_breakdown(
+            side, notional, beta, ticker_a, ticker_b,
+            entry_pa, entry_pb, pa, pb, hedge_style=hedge_style,
+        )
+        pnl = legs["PnL_usd"]
+        is_last_day = day_idx == len(hold_dates) - 1
+
+        if take_profit_eod and pnl > 0:
+            reason = f"Profit EOD (day {day_idx + 1})"
+        elif is_last_day:
+            reason = f"Max hold {max_hold_days}d"
+        else:
+            continue
+
+        return {
+            "exit_td": td,
+            "exit_dt": close_row["DT"],
+            "exit_pa": pa,
+            "exit_pb": pb,
+            "exit_reason": reason,
+            "hold_days": day_idx + 1,
+            "legs": legs,
+            "pnl_usd": pnl,
+        }
+
+    return None
+
+
 def _session_entry_spread(
     panel: pd.DataFrame,
     ticker_a: str,
@@ -467,74 +642,6 @@ def _session_entry_spread(
     }
 
 
-def _resolve_intraday_exit_spread(
-    panel: pd.DataFrame,
-    ticker_a: str,
-    ticker_b: str,
-    td: int,
-    *,
-    side: str,
-    beta: float,
-    notional: float,
-    max_session_loss: float,
-    entry_dt: pd.Timestamp,
-    entry_pa: float,
-    entry_pb: float,
-    hedge_style: str = "beta",
-) -> dict | None:
-    day = panel.loc[panel["Trading date"] == td].sort_values("DT")
-    if day.empty:
-        return None
-
-    session_pnl = 0.0
-    after_entry = day.loc[day["DT"] >= entry_dt]
-    if after_entry.empty:
-        return None
-
-    for _, bar in after_entry.iterrows():
-        pa = float(bar[ticker_a])
-        pb = float(bar[ticker_b])
-        unrealized = _spread_position_pnl_usd(
-            side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb,
-            hedge_style=hedge_style,
-        )
-        if max_session_loss > 0 and session_pnl + unrealized <= -max_session_loss:
-            raw_pnl = unrealized
-            capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, max_session_loss)
-            legs = _spread_leg_breakdown(
-                side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb,
-                hedge_style=hedge_style,
-            )
-            reason = "Session loss cap"
-            if abs(capped_pnl - raw_pnl) > 1e-9:
-                legs = _scale_spread_leg_pnl(legs, capped_pnl)
-                reason = f"{reason} (${max_session_loss:.0f})"
-            return {
-                "exit_dt": bar["DT"],
-                "exit_pa": pa,
-                "exit_pb": pb,
-                "exit_reason": reason,
-                "legs": legs,
-                "pnl_usd": capped_pnl,
-            }
-
-    close_row = day.iloc[-1]
-    pa = float(close_row[ticker_a])
-    pb = float(close_row[ticker_b])
-    legs = _spread_leg_breakdown(
-        side, notional, beta, ticker_a, ticker_b, entry_pa, entry_pb, pa, pb,
-        hedge_style=hedge_style,
-    )
-    return {
-        "exit_dt": close_row["DT"],
-        "exit_pa": pa,
-        "exit_pb": pb,
-        "exit_reason": "EOD",
-        "legs": legs,
-        "pnl_usd": legs["PnL_usd"],
-    }
-
-
 def _session_entry(
     panel: pd.DataFrame,
     ticker: str,
@@ -549,60 +656,6 @@ def _session_entry(
     return {
         "entry_dt": open_row["DT"],
         "entry_price": float(open_row[ticker]),
-    }
-
-
-def _resolve_intraday_exit(
-    panel: pd.DataFrame,
-    trade_ticker: str,
-    td: int,
-    *,
-    side: str,
-    notional: float,
-    max_session_loss: float,
-    entry_dt: pd.Timestamp,
-    entry_price: float,
-) -> dict | None:
-    """Walk 1-min bars; exit on session loss cap or EOD."""
-    day = panel.loc[panel["Trading date"] == td].sort_values("DT")
-    if day.empty or trade_ticker not in day.columns:
-        return None
-
-    session_pnl = 0.0
-    after_entry = day.loc[day["DT"] >= entry_dt]
-    if after_entry.empty:
-        return None
-
-    for _, bar in after_entry.iterrows():
-        mark = float(bar[trade_ticker])
-        unrealized = _position_pnl_usd(
-            side, notional, trade_ticker, entry_price, mark
-        )
-        if max_session_loss > 0 and session_pnl + unrealized <= -max_session_loss:
-            raw_pnl = unrealized
-            capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, max_session_loss)
-            legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
-            reason = "Session loss cap"
-            if abs(capped_pnl - raw_pnl) > 1e-9:
-                legs = _scale_leg_pnl(legs, capped_pnl)
-                reason = f"{reason} (${max_session_loss:.0f})"
-            return {
-                "exit_dt": bar["DT"],
-                "exit_price": mark,
-                "exit_reason": reason,
-                "legs": legs,
-                "pnl_usd": capped_pnl,
-            }
-
-    close_row = day.iloc[-1]
-    mark = float(close_row[trade_ticker])
-    legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
-    return {
-        "exit_dt": close_row["DT"],
-        "exit_price": mark,
-        "exit_reason": "EOD",
-        "legs": legs,
-        "pnl_usd": legs["PnL_usd"],
     }
 
 
@@ -629,17 +682,20 @@ def run_backtest(
 
         td = int(row["Trading date"])
         hedge_type = plan.get("hedge_type", "single")
+        hold_dates = _hold_dates(panel, td, p.max_hold_days)
+        if not hold_dates:
+            continue
 
         if hedge_type == "spread":
             beta_trade = float(row["beta_trade"])
             entry = _session_entry_spread(panel, ticker_a, ticker_b, td)
             if entry is None:
                 continue
-            exit_px = _resolve_intraday_exit_spread(
+            exit_px = _resolve_hold_exit_spread(
                 panel,
                 ticker_a,
                 ticker_b,
-                td,
+                hold_dates,
                 side=plan["side"],
                 beta=beta_trade,
                 notional=p.notional,
@@ -648,27 +704,27 @@ def run_backtest(
                 entry_pa=entry["entry_pa"],
                 entry_pb=entry["entry_pb"],
                 hedge_style=p.hedge_style,
+                max_hold_days=p.max_hold_days,
+                take_profit_eod=p.take_profit_eod,
             )
-            entry_price = entry["entry_pa"]
-            exit_price = exit_px["exit_pa"] if exit_px else float("nan")
             beta_entry = beta_trade
         else:
             trade_ticker = plan["trade_ticker"]
             entry = _session_entry(panel, trade_ticker, td)
             if entry is None:
                 continue
-            exit_px = _resolve_intraday_exit(
+            exit_px = _resolve_hold_exit_single(
                 panel,
                 trade_ticker,
-                td,
+                hold_dates,
                 side=plan["side"],
                 notional=p.notional,
                 max_session_loss=p.max_session_loss,
                 entry_dt=entry["entry_dt"],
                 entry_price=entry["entry_price"],
+                max_hold_days=p.max_hold_days,
+                take_profit_eod=p.take_profit_eod,
             )
-            entry_price = entry["entry_price"]
-            exit_price = exit_px["exit_price"] if exit_px else float("nan")
             beta_entry = float(row["beta_signal"])
 
         if exit_px is None:
@@ -697,8 +753,9 @@ def run_backtest(
             "Trade_ticker": plan["trade_ticker"],
             "Entry_date": td,
             "Entry_time": pd.Timestamp(entry["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
-            "Exit_date": td,
+            "Exit_date": int(exit_px["exit_td"]),
             "Exit_time": pd.Timestamp(exit_px["exit_dt"]).strftime("%Y-%m-%d %H:%M"),
+            "Hold_days": exit_px["hold_days"],
             "Exit_reason": exit_px["exit_reason"],
             "Return_pct": round(return_pct, 4),
             "PnL_$": round(pnl_usd, 2),
@@ -712,8 +769,8 @@ def run_backtest(
             trade_rec["PnL_A_$"] = legs["PnL_A_usd"]
             trade_rec["PnL_B_$"] = legs["PnL_B_usd"]
         else:
-            trade_rec["Entry_price"] = round(entry_price, 4)
-            trade_rec["Exit_price"] = round(exit_price, 4)
+            trade_rec["Entry_price"] = round(entry["entry_price"], 4)
+            trade_rec["Exit_price"] = round(exit_px["exit_price"], 4)
 
         trade_id += 1
         trades.append(trade_rec)
@@ -806,7 +863,12 @@ def summary_stats(
         ("Position", position_row),
         ("Threshold (%)", f"±{p.threshold_pct}"),
         ("Entry", "9:30 open"),
-        ("Exit", "EOD or session loss cap"),
+        (
+            "Exit",
+            f"Profit EOD any day (≤{p.max_hold_days}d) or max hold {p.max_hold_days}d close",
+        ),
+        ("Max hold (sessions)", p.max_hold_days),
+        ("Take profit EOD", "yes" if p.take_profit_eod else "no"),
         ("Max session loss ($)", p.max_session_loss if p.max_session_loss > 0 else "off"),
         (
             "Cap exits",
@@ -860,6 +922,7 @@ def _trades_table_html(trades_df: pd.DataFrame, trade_mode: str) -> str:
             "Signal_surprise_pct",
             "Trade_rule",
             "Entry_date",
+            "Hold_days",
             "Exit_reason",
             "PnL_A_$",
             "PnL_B_$",
@@ -876,6 +939,7 @@ def _trades_table_html(trades_df: pd.DataFrame, trade_mode: str) -> str:
             "Side",
             "Trade_rule",
             "Entry_date",
+            "Hold_days",
             "Exit_reason",
             "Return_pct",
             "PnL_$",
@@ -929,6 +993,7 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Entry_time": row["Entry_time"],
             "Exit_date": int(row["Exit_date"]),
             "Exit_time": row["Exit_time"],
+            "Hold_days": int(row["Hold_days"]),
             "Exit_reason": row["Exit_reason"],
             "Return_pct": float(row["Return_pct"]),
             "PnL_usd": float(row["PnL_$"]),
@@ -1010,7 +1075,9 @@ def build_report_html(
         f"surprise &gt; +{p.threshold_pct}% → <strong>short {ticker_a}</strong>; "
         f"surprise &lt; −{p.threshold_pct}% → <strong>long {ticker_a}</strong> "
         f"(mean-revert).<br>"
-        f"${p.notional:,.0f} single leg; exit EOD or −${p.max_session_loss:.0f} cap."
+        f"${p.notional:,.0f} single leg.<br>"
+        f"Exit: profit at EOD any day (≤{p.max_hold_days} sessions) or "
+        f"close day {p.max_hold_days}; loss cap −${p.max_session_loss:.0f} intraday."
         if p.trade_mode == "surprise"
         else (
             f"<strong>Large spread</strong> (&gt; +{p.threshold_pct}%): <strong>short spread</strong><br>"
@@ -1024,7 +1091,8 @@ def build_report_html(
                     f"(β_trade day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}).<br>"
                 )
             )
-            + f"Exit EOD or −${p.max_session_loss:.0f} cap."
+            + f"Exit: profit at EOD any day (≤{p.max_hold_days} sessions) or "
+            f"close day {p.max_hold_days}; loss cap −${p.max_session_loss:.0f} intraday."
         )
     )
 
@@ -1195,6 +1263,17 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--notional", type=float, default=10_000.0)
     p.add_argument(
+        "--max-hold-days",
+        type=int,
+        default=3,
+        help="Max sessions to hold; exit at EOD if profitable on any day",
+    )
+    p.add_argument(
+        "--no-take-profit-eod",
+        action="store_true",
+        help="Disable profit-taking at EOD; only exit on max hold or loss cap",
+    )
+    p.add_argument(
         "--max-session-loss",
         type=float,
         default=100.0,
@@ -1216,6 +1295,8 @@ def main() -> None:
         max_session_loss=args.max_session_loss,
         trade_mode=args.trade_mode,
         hedge_style=args.hedge_style,
+        max_hold_days=args.max_hold_days,
+        take_profit_eod=not args.no_take_profit_eod,
     )
 
     print(
