@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""
+Daily overreaction mean-reversion on β-hedged session returns.
+
+Signal (known before today's open on session *t*):
+  1. β_signal = OLS on daily returns from sessions *t−21 … t−2* (20 days, excludes yesterday).
+  2. Yesterday (*t−1*) hedged return:
+     diff_ret = r_PAAS − β_signal×r_SLV  (close vs prior close).
+  3. **Overreacted** if diff_ret > +threshold → short spread today.
+     **Underreacted** if diff_ret < −threshold → long spread today.
+
+Execution (session *t*):
+  β_trade = OLS on daily returns *t−20 … t−1* (includes yesterday).
+  Enter **9:30** open; exit **EOD** (last RTH 1-min bar).
+  $10k PAAS leg; SLV leg sized β_trade at entry.
+
+Usage::
+
+    python backtest_daily_overreact.py --start 20230101 --end 20251231
+    python backtest_daily_overreact.py --threshold 3.0 --notional 10000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from silver_backtesting.config import Paths
+from silver_backtesting.pair_quick import load_pair_panel
+from silver_backtesting.spread import ols_beta, pair_daily_returns
+
+OPEN_HOUR = 9
+OPEN_MINUTE = 30
+
+SIGNAL_BETA_OFFSET_START = 21  # day -21
+SIGNAL_BETA_OFFSET_END = 2  # day -2 (inclusive)
+TRADE_BETA_OFFSET_START = 20  # day -20
+TRADE_BETA_OFFSET_END = 1  # day -1 (inclusive)
+
+
+@dataclass
+class DailyOverreactParams:
+    threshold_pct: float = 3.0
+    notional: float = 10_000.0
+
+
+def _leg_breakdown(
+    side: str,
+    notional: float,
+    beta_entry: float,
+    price_a_entry: float,
+    price_b_entry: float,
+    price_a_exit: float,
+    price_b_exit: float,
+) -> dict:
+    n_a = notional
+    n_b = notional * beta_entry
+    sh_a = n_a / price_a_entry if price_a_entry else 0.0
+    sh_b = n_b / price_b_entry if price_b_entry else 0.0
+
+    if side == "long":
+        entry_a_action, entry_b_action = "BUY", "SELL"
+        exit_a_action, exit_b_action = "SELL", "BUY"
+        pnl_a = sh_a * (price_a_exit - price_a_entry)
+        pnl_b = sh_b * (price_b_entry - price_b_exit)
+    else:
+        entry_a_action, entry_b_action = "SELL", "BUY"
+        exit_a_action, exit_b_action = "BUY", "SELL"
+        pnl_a = sh_a * (price_a_entry - price_a_exit)
+        pnl_b = sh_b * (price_b_exit - price_b_entry)
+
+    return {
+        "entry": [
+            {
+                "Leg": "A",
+                "Action": entry_a_action,
+                "Price": round(price_a_entry, 4),
+                "Notional_usd": round(n_a, 2),
+                "Shares": round(sh_a, 4),
+            },
+            {
+                "Leg": "B",
+                "Action": entry_b_action,
+                "Price": round(price_b_entry, 4),
+                "Beta_trade": round(beta_entry, 4),
+                "Notional_usd": round(n_b, 2),
+                "Shares": round(sh_b, 4),
+            },
+        ],
+        "exit": [
+            {
+                "Leg": "A",
+                "Action": exit_a_action,
+                "Price": round(price_a_exit, 4),
+                "Notional_usd": round(sh_a * price_a_exit, 2),
+                "Shares": round(sh_a, 4),
+            },
+            {
+                "Leg": "B",
+                "Action": exit_b_action,
+                "Price": round(price_b_exit, 4),
+                "Notional_usd": round(sh_b * price_b_exit, 2),
+                "Shares": round(sh_b, 4),
+            },
+        ],
+        "PnL_A_usd": round(pnl_a, 2),
+        "PnL_B_usd": round(pnl_b, 2),
+        "PnL_total_usd": round(pnl_a + pnl_b, 2),
+    }
+
+
+def build_signal_panel(
+    panel: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+) -> pd.DataFrame:
+    """
+    One row per tradable session with signal + trade betas and yesterday's diff_ret.
+    """
+    daily_ret = pair_daily_returns(panel, ticker_a, ticker_b)
+    if daily_ret is None or daily_ret.empty:
+        return pd.DataFrame()
+
+    dates = [int(d) for d in daily_ret.index]
+    rows: list[dict] = []
+
+    for i in range(SIGNAL_BETA_OFFSET_START, len(dates)):
+        td = dates[i]
+        signal_beta_dates = dates[i - SIGNAL_BETA_OFFSET_START : i - SIGNAL_BETA_OFFSET_END + 1]
+        trade_beta_dates = dates[i - TRADE_BETA_OFFSET_START : i - TRADE_BETA_OFFSET_END + 1]
+        signal_date = dates[i - 1]
+
+        if len(signal_beta_dates) != SIGNAL_BETA_OFFSET_START - SIGNAL_BETA_OFFSET_END + 1:
+            continue
+        if len(trade_beta_dates) != TRADE_BETA_OFFSET_START - TRADE_BETA_OFFSET_END + 1:
+            continue
+
+        win_signal = daily_ret.loc[signal_beta_dates]
+        win_trade = daily_ret.loc[trade_beta_dates]
+        beta_signal = ols_beta(win_signal[ticker_a], win_signal[ticker_b])
+        beta_trade = ols_beta(win_trade[ticker_a], win_trade[ticker_b])
+        if pd.isna(beta_signal) or pd.isna(beta_trade):
+            continue
+
+        r_a = float(daily_ret.loc[signal_date, ticker_a])
+        r_b = float(daily_ret.loc[signal_date, ticker_b])
+        diff_ret = r_a - beta_signal * r_b
+
+        rows.append(
+            {
+                "Trading date": td,
+                "Signal_date": signal_date,
+                "beta_signal": float(beta_signal),
+                "beta_trade": float(beta_trade),
+                "Signal_r_a_pct": round(r_a * 100, 4),
+                "Signal_r_b_pct": round(r_b * 100, 4),
+                "Signal_diff_ret_pct": round(diff_ret * 100, 4),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("Trading date").reset_index(drop=True)
+
+
+def _open_eod_prices(
+    panel: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    td: int,
+) -> dict | None:
+    day = panel.loc[panel["Trading date"] == td].sort_values("DT")
+    if day.empty:
+        return None
+
+    open_mask = (day["DT"].dt.hour == OPEN_HOUR) & (day["DT"].dt.minute == OPEN_MINUTE)
+    if open_mask.any():
+        open_row = day.loc[open_mask].iloc[0]
+    else:
+        open_row = day.iloc[0]
+
+    close_row = day.iloc[-1]
+    return {
+        "entry_dt": open_row["DT"],
+        "exit_dt": close_row["DT"],
+        "entry_pa": float(open_row[ticker_a]),
+        "entry_pb": float(open_row[ticker_b]),
+        "exit_pa": float(close_row[ticker_a]),
+        "exit_pb": float(close_row[ticker_b]),
+    }
+
+
+def run_backtest(
+    panel: pd.DataFrame,
+    signals: pd.DataFrame,
+    p: DailyOverreactParams,
+    ticker_a: str,
+    ticker_b: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    thresh = p.threshold_pct / 100.0
+    trades: list[dict] = []
+    trade_id = 0
+
+    for _, row in signals.iterrows():
+        diff = float(row["Signal_diff_ret_pct"]) / 100.0
+        if diff > thresh:
+            side = "short"
+            flag = "overreacted"
+        elif diff < -thresh:
+            side = "long"
+            flag = "underreacted"
+        else:
+            continue
+
+        td = int(row["Trading date"])
+        px = _open_eod_prices(panel, ticker_a, ticker_b, td)
+        if px is None:
+            continue
+
+        beta_trade = float(row["beta_trade"])
+        legs = _leg_breakdown(
+            side,
+            p.notional,
+            beta_trade,
+            px["entry_pa"],
+            px["entry_pb"],
+            px["exit_pa"],
+            px["exit_pb"],
+        )
+        pnl_usd = legs["PnL_total_usd"]
+        return_pct = 100.0 * pnl_usd / p.notional if p.notional else 0.0
+
+        trade_id += 1
+        trades.append(
+            {
+                "Trade_id": trade_id,
+                "Signal_date": int(row["Signal_date"]),
+                "Signal_flag": flag,
+                "Signal_diff_ret_pct": row["Signal_diff_ret_pct"],
+                "Beta_signal": round(float(row["beta_signal"]), 4),
+                "Beta_trade": round(beta_trade, 4),
+                "Side": side,
+                "Entry_date": td,
+                "Entry_time": pd.Timestamp(px["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
+                "Exit_date": td,
+                "Exit_time": pd.Timestamp(px["exit_dt"]).strftime("%Y-%m-%d %H:%M"),
+                f"Entry_{ticker_a}": round(px["entry_pa"], 4),
+                f"Entry_{ticker_b}": round(px["entry_pb"], 4),
+                f"Exit_{ticker_a}": round(px["exit_pa"], 4),
+                f"Exit_{ticker_b}": round(px["exit_pb"], 4),
+                "Return_pct": round(return_pct, 4),
+                "PnL_$": round(pnl_usd, 2),
+                "PnL_A_$": legs["PnL_A_usd"],
+                "PnL_B_$": legs["PnL_B_usd"],
+                "_legs": legs,
+            }
+        )
+
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        return trades_df, pd.DataFrame()
+
+    daily_df = (
+        trades_df.groupby("Exit_date", as_index=False)
+        .agg(trades=("Trade_id", "count"), session_pnl=("PnL_$", "sum"))
+        .rename(
+            columns={
+                "Exit_date": "Trading date",
+                "trades": "Trades",
+                "session_pnl": "Session_PnL_$",
+            }
+        )
+        .sort_values("Trading date")
+    )
+    daily_df["Cum_PnL_$"] = daily_df["Session_PnL_$"].cumsum()
+    return trades_df, daily_df
+
+
+def summary_stats(
+    trades_df: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    p: DailyOverreactParams,
+    ticker_a: str,
+    ticker_b: str,
+) -> pd.DataFrame:
+    if trades_df.empty:
+        return pd.DataFrame({"Metric": ["Trades"], "Value": [0]})
+
+    total = trades_df["PnL_$"].sum()
+    wins = (trades_df["PnL_$"] > 0).sum()
+    n = len(trades_df)
+
+    rows = [
+        ("Trades", n),
+        ("Long (underreacted)", int((trades_df["Side"] == "long").sum())),
+        ("Short (overreacted)", int((trades_df["Side"] == "short").sum())),
+        ("Total PnL ($)", round(total, 2)),
+        ("Avg return per trade (%)", round(trades_df["Return_pct"].mean(), 3)),
+        ("Avg PnL per trade ($)", round(trades_df["PnL_$"].mean(), 2)),
+        ("Win rate (%)", round(100 * wins / n, 1)),
+        ("Best trade ($)", round(trades_df["PnL_$"].max(), 2)),
+        ("Worst trade ($)", round(trades_df["PnL_$"].min(), 2)),
+        ("Signal β window", f"day −{SIGNAL_BETA_OFFSET_START} … −{SIGNAL_BETA_OFFSET_END}"),
+        ("Trade β window", f"day −{TRADE_BETA_OFFSET_START} … −{TRADE_BETA_OFFSET_END}"),
+        ("Signal metric", f"r_{ticker_a} − β_signal×r_{ticker_b} on prior session (%)"),
+        ("Threshold (%)", f"±{p.threshold_pct}"),
+        ("Entry", "9:30 open"),
+        ("Exit", "EOD (last RTH bar)"),
+        ("Notional leg A", p.notional),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
+
+
+def _trading_dates_for_plot(daily_df: pd.DataFrame) -> pd.Series:
+    return pd.to_datetime(daily_df["Trading date"].astype(str), format="%Y%m%d")
+
+
+def _daily_table_html(daily_df: pd.DataFrame) -> str:
+    if daily_df.empty:
+        return "<p>No trades</p>"
+    cols = list(daily_df.columns)
+    parts = [
+        "<table id='daily-pnl-table' class='data-table interactive-table'>",
+        "<thead><tr>",
+        *[f"<th>{c}</th>" for c in cols],
+        "</tr></thead><tbody>",
+    ]
+    for _, row in daily_df.iterrows():
+        td = int(row["Trading date"])
+        parts.append(f"<tr class='daily-row' data-td='{td}' tabindex='0'>")
+        for c in cols:
+            val = row[c]
+            if c in ("Session_PnL_$", "Cum_PnL_$") and pd.notna(val):
+                text = f"{float(val):,.2f}"
+            else:
+                text = str(val)
+            parts.append(f"<td>{text}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _trades_table_html(trades_df: pd.DataFrame) -> str:
+    if trades_df.empty:
+        return "<p>No trades</p>"
+    cols = [
+        "Trade_id",
+        "Signal_date",
+        "Signal_flag",
+        "Side",
+        "Signal_diff_ret_pct",
+        "Beta_signal",
+        "Beta_trade",
+        "Entry_date",
+        "Return_pct",
+        "PnL_$",
+    ]
+    parts = [
+        "<table id='trades-table' class='data-table interactive-table'>",
+        "<thead><tr>",
+        *[f"<th>{c}</th>" for c in cols],
+        "</tr></thead><tbody>",
+    ]
+    for _, row in trades_df.iterrows():
+        tid = int(row["Trade_id"])
+        parts.append(f"<tr class='trade-row' data-trade='{tid}' tabindex='0'>")
+        for c in cols:
+            val = row[c]
+            if c == "PnL_$" and pd.notna(val):
+                text = f"{float(val):,.2f}"
+            elif c in ("Signal_diff_ret_pct", "Return_pct") and pd.notna(val):
+                text = f"{float(val):,.4f}"
+            else:
+                text = str(val)
+            parts.append(f"<td>{text}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
+    if trades_df.empty:
+        return "{}"
+    out: dict[str, dict] = {}
+    for _, row in trades_df.iterrows():
+        tid = str(int(row["Trade_id"]))
+        out[tid] = {
+            "Trade_id": int(row["Trade_id"]),
+            "Signal_date": int(row["Signal_date"]),
+            "Signal_flag": row["Signal_flag"],
+            "Signal_diff_ret_pct": float(row["Signal_diff_ret_pct"]),
+            "Beta_signal": float(row["Beta_signal"]),
+            "Beta_trade": float(row["Beta_trade"]),
+            "Side": row["Side"],
+            "Entry_date": int(row["Entry_date"]),
+            "Entry_time": row["Entry_time"],
+            "Exit_date": int(row["Exit_date"]),
+            "Exit_time": row["Exit_time"],
+            f"Entry_{ticker_a}": float(row[f"Entry_{ticker_a}"]),
+            f"Entry_{ticker_b}": float(row[f"Entry_{ticker_b}"]),
+            f"Exit_{ticker_a}": float(row[f"Exit_{ticker_a}"]),
+            f"Exit_{ticker_b}": float(row[f"Exit_{ticker_b}"]),
+            "Return_pct": float(row["Return_pct"]),
+            "PnL_A_usd": float(row["PnL_A_$"]),
+            "PnL_B_usd": float(row["PnL_B_$"]),
+            "legs": row["_legs"],
+            "ticker_a": ticker_a,
+            "ticker_b": ticker_b,
+        }
+    return json.dumps(out)
+
+
+def _trades_by_exit_json(trades_df: pd.DataFrame) -> str:
+    if trades_df.empty:
+        return "{}"
+    grouped: dict[str, list[int]] = {}
+    for _, row in trades_df.iterrows():
+        td = str(int(row["Exit_date"]))
+        grouped.setdefault(td, []).append(int(row["Trade_id"]))
+    return json.dumps(grouped)
+
+
+def build_report_html(
+    summary: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    p: DailyOverreactParams,
+) -> str:
+    fig = make_subplots(rows=2, cols=1, row_heights=[0.45, 0.55], vertical_spacing=0.08)
+    if not daily_df.empty:
+        x_dates = _trading_dates_for_plot(daily_df)
+        fig.add_trace(
+            go.Bar(x=x_dates, y=daily_df["Session_PnL_$"], name="Daily PnL"),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_dates,
+                y=daily_df["Cum_PnL_$"],
+                mode="lines",
+                name="Cumulative PnL",
+            ),
+            row=2,
+            col=1,
+        )
+    fig.update_layout(
+        template="plotly_white",
+        height=700,
+        title="Daily overreaction backtest — cumulative PnL",
+    )
+    fig.update_xaxes(title_text="Trading date", row=1, col=1)
+    fig.update_xaxes(title_text="Trading date", row=2, col=1)
+    fig.update_yaxes(title_text="Daily PnL ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Cumulative PnL ($)", row=2, col=1)
+    chart = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="pnl-chart")
+
+    td_dates = (
+        {
+            str(int(td)): pd.to_datetime(str(int(td)), format="%Y%m%d").strftime("%Y-%m-%d")
+            for td in daily_df["Trading date"].unique()
+        }
+        if not daily_df.empty
+        else {}
+    )
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Daily overreaction backtest</title>
+<style>
+body {{ font-family: sans-serif; margin: 2rem; }}
+h1,h2,h3 {{ color: #0066cc; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+th {{ background: #0066cc; color: white; padding: 6px; text-align: left; }}
+td {{ border: 1px solid #ddd; padding: 6px; }}
+.interactive-table tbody tr.daily-row,
+.interactive-table tbody tr.trade-row {{ cursor: pointer; }}
+.interactive-table tbody tr:hover {{ background: #eef6ff; }}
+.interactive-table tbody tr.selected {{ background: #cce0ff; font-weight: 600; }}
+#explainer {{ background: #f7f9fc; border-left: 4px solid #0066cc; padding: 0.75rem 1rem; margin: 0.5rem 0 1rem; font-size: 13px; line-height: 1.5; }}
+</style></head><body>
+<h1>Daily overreaction — {ticker_a} vs {ticker_b}</h1>
+<h2>Summary</h2>{summary.to_html(index=False, classes="data-table", border=0)}
+<div>{chart}</div>
+<h2>Daily PnL</h2>
+<p>Click a row, chart bar, or trade for leg detail.</p>
+{_daily_table_html(daily_df)}
+<h2>All trades</h2>
+{_trades_table_html(trades_df)}
+<h2 id="legs-title">Trade legs</h2>
+<div id="explainer">
+  <strong>Signal β</strong> (day −{SIGNAL_BETA_OFFSET_START}…−{SIGNAL_BETA_OFFSET_END}): OLS on daily returns.<br>
+  <strong>Yesterday diff_ret</strong> = r_{ticker_a} − β_signal×r_{ticker_b}.<br>
+  <strong>Overreacted</strong> (&gt; +{p.threshold_pct}%): short spread — SELL {ticker_a}, BUY β_trade×{ticker_b}.<br>
+  <strong>Underreacted</strong> (&lt; −{p.threshold_pct}%): long spread — opposite.<br>
+  <strong>Trade β</strong> (day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}) sizes hedge at 9:30; exit EOD.
+</div>
+<p id="trade-meta">No trade selected.</p>
+<div id="legs-panel"><p>Select a trade above.</p></div>
+<script>
+const TRADES = {_trades_json(trades_df, ticker_a, ticker_b)};
+const TRADES_BY_EXIT = {_trades_by_exit_json(trades_df)};
+const TD_LABELS = {json.dumps(td_dates)};
+
+function legTable(title, timeLabel, legs, tickerA, tickerB) {{
+  let html = '<h3>' + title + ' (' + timeLabel + ')</h3>';
+  html += '<table class="data-table"><thead><tr><th>Leg</th><th>Action</th><th>Price</th><th>Notional $</th><th>Shares</th></tr></thead><tbody>';
+  for (const leg of legs) {{
+    const name = leg.Leg === 'A' ? tickerA : tickerB;
+    html += '<tr><td>' + name + '</td><td>' + leg.Action + '</td><td>' + leg.Price + '</td><td>' + leg.Notional_usd + '</td><td>' + leg.Shares + '</td></tr>';
+  }}
+  html += '</tbody></table>';
+  return html;
+}}
+
+function renderTrade(tradeId) {{
+  const t = TRADES[String(tradeId)];
+  if (!t) return;
+  const title = document.getElementById('legs-title');
+  const meta = document.getElementById('trade-meta');
+  const panel = document.getElementById('legs-panel');
+  const pnlTotal = t.PnL_A_usd + t.PnL_B_usd;
+  title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' (' + t.Signal_flag + ')';
+  meta.textContent =
+    'Signal ' + t.Signal_date + ' diff_ret ' + t.Signal_diff_ret_pct.toFixed(3) + '%'
+    + ' | β_signal ' + t.Beta_signal + ' β_trade ' + t.Beta_trade
+    + ' | Entry ' + t.Entry_time + ' Exit ' + t.Exit_time
+    + ' | PnL $' + pnlTotal.toFixed(2);
+
+  let html = legTable('Entry legs', t.Entry_time, t.legs.entry, t.ticker_a, t.ticker_b);
+  html += legTable('Exit legs', t.Exit_time, t.legs.exit, t.ticker_a, t.ticker_b);
+  html += '<table class="data-table"><thead><tr><th>Leg PnL</th><th>$</th></tr></thead><tbody>';
+  html += '<tr><td>' + t.ticker_a + '</td><td>' + t.PnL_A_usd.toFixed(2) + '</td></tr>';
+  html += '<tr><td>' + t.ticker_b + ' (hedge)</td><td>' + t.PnL_B_usd.toFixed(2) + '</td></tr>';
+  html += '<tr><td><b>Total</b></td><td><b>' + pnlTotal.toFixed(2) + '</b></td></tr>';
+  html += '</tbody></table>';
+  panel.innerHTML = html;
+}}
+
+function selectTrade(tradeId) {{
+  document.querySelectorAll('.trade-row').forEach(tr => {{
+    tr.classList.toggle('selected', tr.dataset.trade === String(tradeId));
+  }});
+  document.querySelectorAll('.daily-row').forEach(tr => tr.classList.remove('selected'));
+  renderTrade(tradeId);
+  document.getElementById('legs-panel').scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+}}
+
+function selectDailyRow(td) {{
+  document.querySelectorAll('.daily-row').forEach(tr => {{
+    tr.classList.toggle('selected', tr.dataset.td === String(td));
+  }});
+  const ids = TRADES_BY_EXIT[String(td)] || [];
+  if (ids.length === 1) selectTrade(ids[0]);
+  else if (ids.length > 1) {{
+    document.querySelectorAll('.trade-row').forEach(tr => tr.classList.remove('selected'));
+    document.getElementById('legs-title').textContent = 'Trades on ' + (TD_LABELS[String(td)] || td);
+    document.getElementById('trade-meta').textContent = ids.length + ' trades — click a trade row.';
+    let html = '<ul>';
+    ids.forEach(id => {{
+      const t = TRADES[String(id)];
+      html += '<li><a href="#" data-trade="' + id + '">#' + id + ' ' + t.Side + ' PnL $' + (t.PnL_A_usd + t.PnL_B_usd).toFixed(2) + '</a></li>';
+    }});
+    html += '</ul>';
+    document.getElementById('legs-panel').innerHTML = html;
+    document.querySelectorAll('#legs-panel a[data-trade]').forEach(a => {{
+      a.addEventListener('click', e => {{ e.preventDefault(); selectTrade(a.dataset.trade); }});
+    }});
+  }} else {{
+    document.getElementById('legs-panel').innerHTML = '<p>No trades for this date.</p>';
+  }}
+}}
+
+document.querySelectorAll('.trade-row').forEach(tr => {{
+  tr.addEventListener('click', () => selectTrade(tr.dataset.trade));
+}});
+document.querySelectorAll('.daily-row').forEach(tr => {{
+  tr.addEventListener('click', () => selectDailyRow(tr.dataset.td));
+}});
+
+const chartEl = document.getElementById('pnl-chart');
+if (chartEl) {{
+  chartEl.on('plotly_click', ev => {{
+    if (!ev.points || !ev.points.length) return;
+    const d = new Date(ev.points[0].x);
+    const td = String(d.getFullYear())
+      + String(d.getMonth() + 1).padStart(2, '0')
+      + String(d.getDate()).padStart(2, '0');
+    selectDailyRow(td);
+  }});
+}}
+
+if (Object.keys(TRADES).length) {{
+  const lastId = Object.keys(TRADES).sort((a,b) => Number(a)-Number(b)).pop();
+  selectTrade(lastId);
+}}
+</script>
+</body></html>"""
+
+
+def _parse_args() -> argparse.Namespace:
+    today = datetime.now() - timedelta(days=3)
+    default_end = int(today.strftime("%Y%m%d"))
+    default_start = int((today - timedelta(days=365 * 2)).strftime("%Y%m%d"))
+
+    p = argparse.ArgumentParser(
+        description="Daily overreaction: prior-day hedged return signal, open-to-EOD trade."
+    )
+    p.add_argument("--ticker-a", default="PAAS")
+    p.add_argument("--ticker-b", default="SLV")
+    p.add_argument("--start", type=int, default=default_start)
+    p.add_argument("--end", type=int, default=default_end)
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=3.0,
+        help="Signal threshold on prior-day diff_ret (%%); default 3",
+    )
+    p.add_argument("--notional", type=float, default=10_000.0)
+    p.add_argument("--data-folder", default=None)
+    p.add_argument("--output", default="backtest_daily_overreact.html")
+    p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--export-csv", default=None)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    folder = args.data_folder or Paths().min_folder
+    params = DailyOverreactParams(
+        threshold_pct=args.threshold,
+        notional=args.notional,
+    )
+
+    print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}) …")
+    panel = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
+    signals = build_signal_panel(panel, args.ticker_a, args.ticker_b)
+    print(f"  {panel['Trading date'].nunique()} sessions, {len(signals)} days with signal betas")
+
+    trades_df, daily_df = run_backtest(
+        panel, signals, params, args.ticker_a, args.ticker_b
+    )
+    summary = summary_stats(
+        trades_df, daily_df, params, args.ticker_a, args.ticker_b
+    )
+    print("\n=== Summary ===")
+    print(summary.to_string(index=False))
+
+    out = args.output
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(
+            build_report_html(
+                summary, trades_df, daily_df, args.ticker_a, args.ticker_b, params
+            )
+        )
+    print(f"\nReport: {out}")
+
+    if args.export_csv:
+        os.makedirs(args.export_csv, exist_ok=True)
+        signals.to_csv(os.path.join(args.export_csv, "signals.csv"), index=False)
+        trades_df.drop(columns=["_legs"]).to_csv(
+            os.path.join(args.export_csv, "trades.csv"), index=False
+        )
+        daily_df.to_csv(os.path.join(args.export_csv, "daily_pnl.csv"), index=False)
+        print(f"CSV exported to {args.export_csv}")
+
+    if not args.no_browser:
+        webbrowser.open(f"file://{os.path.abspath(out)}")
+
+
+if __name__ == "__main__":
+    main()
