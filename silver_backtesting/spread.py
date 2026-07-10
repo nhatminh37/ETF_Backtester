@@ -205,7 +205,7 @@ def pair_15min_returns(
     cmdty: str,
     bar_minutes: int = 15,
 ) -> pd.DataFrame | None:
-    """15-min close-to-close returns within each RTH session."""
+    """Bar close-to-close returns within each RTH session (``bar_minutes`` e.g. 15 or 60)."""
     if ticker not in df.columns or cmdty not in df.columns:
         return None
     mask = df["ind_nyse_rth"] == True
@@ -311,6 +311,28 @@ def _spread_vs_session_anchor(
     return out.reindex(group.index)
 
 
+def prior_session_bar_beta_by_date(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    bar_minutes: int = 15,
+) -> pd.Series:
+    """For session *t*, OLS β from all ``bar_minutes`` returns on prior session."""
+    bars = pair_15min_returns(df, ticker, cmdty, bar_minutes)
+    if bars is None or bars.empty:
+        return pd.Series(dtype=float)
+
+    by_session: dict[int, float] = {}
+    for td, day in bars.groupby("Trading date"):
+        by_session[int(td)] = ols_beta(day[ticker], day[cmdty])
+
+    dates = sorted(by_session)
+    lagged: dict[int, float] = {}
+    for i in range(1, len(dates)):
+        lagged[dates[i]] = by_session[dates[i - 1]]
+    return pd.Series(lagged, name=f"beta_{bar_minutes}m")
+
+
 def prior_session_15m_beta_by_date(
     df: pd.DataFrame,
     ticker: str,
@@ -318,19 +340,20 @@ def prior_session_15m_beta_by_date(
     bar_minutes: int = 15,
 ) -> pd.Series:
     """For session *t*, OLS β from all 15-min returns on prior session."""
-    fifteen = pair_15min_returns(df, ticker, cmdty, bar_minutes)
-    if fifteen is None or fifteen.empty:
-        return pd.Series(dtype=float)
+    out = prior_session_bar_beta_by_date(df, ticker, cmdty, bar_minutes)
+    out.name = "beta_D"
+    return out
 
-    by_session: dict[int, float] = {}
-    for td, day in fifteen.groupby("Trading date"):
-        by_session[int(td)] = ols_beta(day[ticker], day[cmdty])
 
-    dates = sorted(by_session)
-    lagged: dict[int, float] = {}
-    for i in range(1, len(dates)):
-        lagged[dates[i]] = by_session[dates[i - 1]]
-    return pd.Series(lagged, name="beta_D")
+def prior_session_1h_beta_by_date(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+) -> pd.Series:
+    """For session *t*, OLS β from all 1-hour returns on prior session (β_E)."""
+    out = prior_session_bar_beta_by_date(df, ticker, cmdty, bar_minutes=60)
+    out.name = "beta_E"
+    return out
 
 
 def _attach_beta_price_spread(
@@ -418,6 +441,34 @@ def attach_beta_d_price_spread(
     )
 
 
+def attach_beta_e_price_spread(
+    df: pd.DataFrame,
+    ticker: str,
+    cmdty: str,
+    anchor_hour: int = 9,
+    anchor_minute: int = 45,
+) -> pd.DataFrame:
+    """
+    Dollar β_E price spread (not returns).
+
+    β_E = OLS on **prior session** 1-hour returns. Adds ``{spread}_beta_E``,
+    ``{spread}_price_bE``, ``{spread}_price_bE_vs_945``.
+    """
+    spread_col = f"{ticker}-{cmdty}"
+    beta_by_date = prior_session_1h_beta_by_date(df, ticker, cmdty)
+    return _attach_beta_price_spread(
+        df,
+        ticker,
+        cmdty,
+        beta_by_date,
+        beta_col=f"{spread_col}_beta_E",
+        level_col=f"{spread_col}_price_bE",
+        vs_col=f"{spread_col}_price_bE_vs_945",
+        anchor_hour=anchor_hour,
+        anchor_minute=anchor_minute,
+    )
+
+
 def _map_session_beta_ma(
     sub: pd.DataFrame,
     beta_col: str,
@@ -467,7 +518,7 @@ def beta_price_spread_figure(
     """
     Large Plotly chart for β dollar price spread (1-min RTH).
 
-    ``beta``: ``"20"`` (20-day daily) or ``"D"`` (prior session 15m).
+    ``beta``: ``"20"`` (20-day daily), ``"D"`` (prior session 15m), or ``"E"`` (prior session 1h).
     ``beta_ma_windows``: session rolling means on β panel (e.g. [5, 10, 20]).
     """
     import plotly.graph_objects as go
@@ -487,9 +538,15 @@ def beta_price_spread_figure(
             "vs_col": f"{spread_col}_price_bD_vs_945",
             "label": "β_D",
         },
+        "E": {
+            "beta_col": f"{spread_col}_beta_E",
+            "level_col": f"{spread_col}_price_bE",
+            "vs_col": f"{spread_col}_price_bE_vs_945",
+            "label": "β_E",
+        },
     }
     if beta not in specs:
-        raise ValueError(f"beta must be '20' or 'D', got {beta!r}")
+        raise ValueError(f"beta must be '20', 'D', or 'E', got {beta!r}")
     cfg = specs[beta]
     level_col = cfg["level_col"]
     vs_col = cfg["vs_col"]
@@ -497,7 +554,12 @@ def beta_price_spread_figure(
     beta_label = cfg["label"]
 
     if level_col not in df.columns:
-        fn = "attach_beta20_price_spread" if beta == "20" else "attach_beta_d_price_spread"
+        attach_fns = {
+            "20": "attach_beta20_price_spread",
+            "D": "attach_beta_d_price_spread",
+            "E": "attach_beta_e_price_spread",
+        }
+        fn = attach_fns[beta]
         raise ValueError(f"Missing {level_col}; call {fn} first.")
 
     sub = df.loc[df["ind_nyse_rth"] == True].copy()

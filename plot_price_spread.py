@@ -12,6 +12,9 @@ Usage::
     # β₂₀ (20-day daily lookback):
     python plot_price_spread.py --start 20250101 --end 20251231 --mode range --beta 20
 
+    # β_E (prior session 1h OLS):
+    python plot_price_spread.py --start 20250101 --end 20251231 --mode range --beta E
+
     # Single session (3 panels: vs 9:45, level, β):
     python plot_price_spread.py --start 20250101 --end 20251231 --date 20250910 --mode day --beta D
 
@@ -35,6 +38,7 @@ from silver_backtesting.pair_quick import load_pair_panel
 from silver_backtesting.spread import (
     attach_beta20_price_spread,
     attach_beta_d_price_spread,
+    attach_beta_e_price_spread,
     beta_price_spread_figure,
 )
 
@@ -54,7 +58,7 @@ def _parse_args() -> argparse.Namespace:
     default_start = int((today - timedelta(days=45)).strftime("%Y%m%d"))
 
     p = argparse.ArgumentParser(
-        description="Plot dollar price spread (β₂₀ or β_D hedge, large figure)."
+        description="Plot dollar price spread (β₂₀, β_D, or β_E hedge, large figure)."
     )
     p.add_argument("--ticker-a", default="PAAS")
     p.add_argument("--ticker-b", default="SLV")
@@ -70,9 +74,10 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--beta",
-        choices=("20", "D"),
+        choices=("20", "D", "E"),
         default="20",
-        help="Hedge: '20' = 20-day daily OLS; 'D' = prior session 15m OLS (backtest β_D)",
+        help="Hedge: '20' = 20-day daily OLS; 'D' = prior session 15m OLS; "
+        "'E' = prior session 1h OLS (β_E)",
     )
     p.add_argument("--beta-lookback", type=int, default=20, help="Days for --beta 20 only")
     p.add_argument("--data-folder", default=None)
@@ -96,12 +101,14 @@ def main() -> None:
     args = _parse_args()
     folder = args.data_folder or Paths().min_folder
     mode = args.mode or ("day" if args.date is not None else "range")
-    beta_label = "β_D" if args.beta == "D" else "β₂₀"
+    beta_label = {"D": "β_D", "E": "β_E"}.get(args.beta, "β₂₀")
 
     print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}), {beta_label} …")
     panel = load_pair_panel(args.ticker_a, args.ticker_b, folder, args.start, args.end)
     if args.beta == "D":
         df = attach_beta_d_price_spread(panel, args.ticker_a, args.ticker_b)
+    elif args.beta == "E":
+        df = attach_beta_e_price_spread(panel, args.ticker_a, args.ticker_b)
     else:
         df = attach_beta20_price_spread(
             panel,
