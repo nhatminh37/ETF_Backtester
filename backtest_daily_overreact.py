@@ -11,13 +11,14 @@ Signal (known before today's open on session *t*):
 
 Execution (session *t*):
   β_trade = OLS on daily returns *t−20 … t−1* (includes yesterday).
-  Enter **9:30** open; exit **EOD** (last RTH 1-min bar).
+  Enter **9:30** open; exit **EOD** (last RTH 1-min bar) or when session PnL
+  hits **−$100** loss cap (``--max-session-loss``).
   $10k PAAS leg; SLV leg sized β_trade at entry.
 
 Usage::
 
     python backtest_daily_overreact.py --start 20230101 --end 20251231
-    python backtest_daily_overreact.py --threshold 3.0 --notional 10000
+    python backtest_daily_overreact.py --threshold 3.0 --notional 10000 --max-session-loss 100
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ TRADE_BETA_OFFSET_END = 1  # day -1 (inclusive)
 class DailyOverreactParams:
     threshold_pct: float = 3.0
     notional: float = 10_000.0
+    max_session_loss: float = 100.0
 
 
 def _leg_breakdown(
@@ -117,6 +119,38 @@ def _leg_breakdown(
     }
 
 
+def _position_pnl_usd(
+    side: str,
+    notional: float,
+    beta: float,
+    entry_pa: float,
+    entry_pb: float,
+    mark_pa: float,
+    mark_pb: float,
+) -> float:
+    return _leg_breakdown(
+        side, notional, beta, entry_pa, entry_pb, mark_pa, mark_pb
+    )["PnL_total_usd"]
+
+
+def _cap_session_pnl(session_pnl: float, raw_pnl: float, max_session_loss: float) -> float:
+    if max_session_loss <= 0:
+        return raw_pnl
+    return max(raw_pnl, -max_session_loss - session_pnl)
+
+
+def _scale_leg_pnl(legs: dict, capped_total: float) -> dict:
+    raw = legs["PnL_total_usd"]
+    if raw == 0 or abs(raw - capped_total) < 1e-9:
+        return legs
+    scale = capped_total / raw
+    out = dict(legs)
+    out["PnL_A_usd"] = round(legs["PnL_A_usd"] * scale, 2)
+    out["PnL_B_usd"] = round(legs["PnL_B_usd"] * scale, 2)
+    out["PnL_total_usd"] = round(capped_total, 2)
+    return out
+
+
 def build_signal_panel(
     panel: pd.DataFrame,
     ticker_a: str,
@@ -169,7 +203,7 @@ def build_signal_panel(
     return pd.DataFrame(rows).sort_values("Trading date").reset_index(drop=True)
 
 
-def _open_eod_prices(
+def _session_entry(
     panel: pd.DataFrame,
     ticker_a: str,
     ticker_b: str,
@@ -180,19 +214,76 @@ def _open_eod_prices(
         return None
 
     open_mask = (day["DT"].dt.hour == OPEN_HOUR) & (day["DT"].dt.minute == OPEN_MINUTE)
-    if open_mask.any():
-        open_row = day.loc[open_mask].iloc[0]
-    else:
-        open_row = day.iloc[0]
-
-    close_row = day.iloc[-1]
+    open_row = day.loc[open_mask].iloc[0] if open_mask.any() else day.iloc[0]
     return {
         "entry_dt": open_row["DT"],
-        "exit_dt": close_row["DT"],
         "entry_pa": float(open_row[ticker_a]),
         "entry_pb": float(open_row[ticker_b]),
-        "exit_pa": float(close_row[ticker_a]),
-        "exit_pb": float(close_row[ticker_b]),
+    }
+
+
+def _resolve_intraday_exit(
+    panel: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    td: int,
+    *,
+    side: str,
+    beta_trade: float,
+    notional: float,
+    max_session_loss: float,
+    entry_dt: pd.Timestamp,
+    entry_pa: float,
+    entry_pb: float,
+) -> dict | None:
+    """Walk 1-min bars; exit on session loss cap or EOD."""
+    day = panel.loc[panel["Trading date"] == td].sort_values("DT")
+    if day.empty:
+        return None
+
+    session_pnl = 0.0
+    after_entry = day.loc[day["DT"] >= entry_dt]
+    if after_entry.empty:
+        return None
+
+    for _, bar in after_entry.iterrows():
+        pa = float(bar[ticker_a])
+        pb = float(bar[ticker_b])
+        unrealized = _position_pnl_usd(
+            side, notional, beta_trade, entry_pa, entry_pb, pa, pb
+        )
+        if max_session_loss > 0 and session_pnl + unrealized <= -max_session_loss:
+            raw_pnl = unrealized
+            capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, max_session_loss)
+            legs = _leg_breakdown(
+                side, notional, beta_trade, entry_pa, entry_pb, pa, pb
+            )
+            reason = "Session loss cap"
+            if abs(capped_pnl - raw_pnl) > 1e-9:
+                legs = _scale_leg_pnl(legs, capped_pnl)
+                reason = f"{reason} (${max_session_loss:.0f})"
+            return {
+                "exit_dt": bar["DT"],
+                "exit_pa": pa,
+                "exit_pb": pb,
+                "exit_reason": reason,
+                "legs": legs,
+                "pnl_usd": capped_pnl,
+            }
+
+    close_row = day.iloc[-1]
+    pa = float(close_row[ticker_a])
+    pb = float(close_row[ticker_b])
+    legs = _leg_breakdown(
+        side, notional, beta_trade, entry_pa, entry_pb, pa, pb
+    )
+    return {
+        "exit_dt": close_row["DT"],
+        "exit_pa": pa,
+        "exit_pb": pb,
+        "exit_reason": "EOD",
+        "legs": legs,
+        "pnl_usd": legs["PnL_total_usd"],
     }
 
 
@@ -219,21 +310,29 @@ def run_backtest(
             continue
 
         td = int(row["Trading date"])
-        px = _open_eod_prices(panel, ticker_a, ticker_b, td)
-        if px is None:
+        entry = _session_entry(panel, ticker_a, ticker_b, td)
+        if entry is None:
             continue
 
         beta_trade = float(row["beta_trade"])
-        legs = _leg_breakdown(
-            side,
-            p.notional,
-            beta_trade,
-            px["entry_pa"],
-            px["entry_pb"],
-            px["exit_pa"],
-            px["exit_pb"],
+        exit_px = _resolve_intraday_exit(
+            panel,
+            ticker_a,
+            ticker_b,
+            td,
+            side=side,
+            beta_trade=beta_trade,
+            notional=p.notional,
+            max_session_loss=p.max_session_loss,
+            entry_dt=entry["entry_dt"],
+            entry_pa=entry["entry_pa"],
+            entry_pb=entry["entry_pb"],
         )
-        pnl_usd = legs["PnL_total_usd"]
+        if exit_px is None:
+            continue
+
+        legs = exit_px["legs"]
+        pnl_usd = exit_px["pnl_usd"]
         return_pct = 100.0 * pnl_usd / p.notional if p.notional else 0.0
 
         trade_id += 1
@@ -247,13 +346,14 @@ def run_backtest(
                 "Beta_trade": round(beta_trade, 4),
                 "Side": side,
                 "Entry_date": td,
-                "Entry_time": pd.Timestamp(px["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
+                "Entry_time": pd.Timestamp(entry["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
                 "Exit_date": td,
-                "Exit_time": pd.Timestamp(px["exit_dt"]).strftime("%Y-%m-%d %H:%M"),
-                f"Entry_{ticker_a}": round(px["entry_pa"], 4),
-                f"Entry_{ticker_b}": round(px["entry_pb"], 4),
-                f"Exit_{ticker_a}": round(px["exit_pa"], 4),
-                f"Exit_{ticker_b}": round(px["exit_pb"], 4),
+                "Exit_time": pd.Timestamp(exit_px["exit_dt"]).strftime("%Y-%m-%d %H:%M"),
+                "Exit_reason": exit_px["exit_reason"],
+                f"Entry_{ticker_a}": round(entry["entry_pa"], 4),
+                f"Entry_{ticker_b}": round(entry["entry_pb"], 4),
+                f"Exit_{ticker_a}": round(exit_px["exit_pa"], 4),
+                f"Exit_{ticker_b}": round(exit_px["exit_pb"], 4),
                 "Return_pct": round(return_pct, 4),
                 "PnL_$": round(pnl_usd, 2),
                 "PnL_A_$": legs["PnL_A_usd"],
@@ -311,7 +411,12 @@ def summary_stats(
         ("Signal metric", f"r_{ticker_a} − β_signal×r_{ticker_b} on prior session (%)"),
         ("Threshold (%)", f"±{p.threshold_pct}"),
         ("Entry", "9:30 open"),
-        ("Exit", "EOD (last RTH bar)"),
+        ("Exit", "EOD or session loss cap"),
+        ("Max session loss ($)", p.max_session_loss if p.max_session_loss > 0 else "off"),
+        (
+            "Cap exits",
+            int(trades_df["Exit_reason"].astype(str).str.contains("loss cap").sum()),
+        ),
         ("Notional leg A", p.notional),
     ]
     return pd.DataFrame(rows, columns=["Metric", "Value"])
@@ -358,6 +463,7 @@ def _trades_table_html(trades_df: pd.DataFrame) -> str:
         "Beta_signal",
         "Beta_trade",
         "Entry_date",
+        "Exit_reason",
         "Return_pct",
         "PnL_$",
     ]
@@ -402,6 +508,7 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Entry_time": row["Entry_time"],
             "Exit_date": int(row["Exit_date"]),
             "Exit_time": row["Exit_time"],
+            "Exit_reason": row["Exit_reason"],
             f"Entry_{ticker_a}": float(row[f"Entry_{ticker_a}"]),
             f"Entry_{ticker_b}": float(row[f"Entry_{ticker_b}"]),
             f"Exit_{ticker_a}": float(row[f"Exit_{ticker_a}"]),
@@ -500,7 +607,8 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
   <strong>Yesterday diff_ret</strong> = r_{ticker_a} − β_signal×r_{ticker_b}.<br>
   <strong>Overreacted</strong> (&gt; +{p.threshold_pct}%): short spread — SELL {ticker_a}, BUY β_trade×{ticker_b}.<br>
   <strong>Underreacted</strong> (&lt; −{p.threshold_pct}%): long spread — opposite.<br>
-  <strong>Trade β</strong> (day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}) sizes hedge at 9:30; exit EOD.
+  <strong>Trade β</strong> (day −{TRADE_BETA_OFFSET_START}…−{TRADE_BETA_OFFSET_END}) sizes hedge at 9:30.<br>
+  <strong>Exit:</strong> EOD, or intraday if mark-to-market PnL ≤ −${p.max_session_loss:.0f} (``--max-session-loss``).
 </div>
 <p id="trade-meta">No trade selected.</p>
 <div id="legs-panel"><p>Select a trade above.</p></div>
@@ -532,6 +640,7 @@ function renderTrade(tradeId) {{
     'Signal ' + t.Signal_date + ' diff_ret ' + t.Signal_diff_ret_pct.toFixed(3) + '%'
     + ' | β_signal ' + t.Beta_signal + ' β_trade ' + t.Beta_trade
     + ' | Entry ' + t.Entry_time + ' Exit ' + t.Exit_time
+    + ' (' + t.Exit_reason + ')'
     + ' | PnL $' + pnlTotal.toFixed(2);
 
   let html = legTable('Entry legs', t.Entry_time, t.legs.entry, t.ticker_a, t.ticker_b);
@@ -624,6 +733,12 @@ def _parse_args() -> argparse.Namespace:
         help="Signal threshold on prior-day diff_ret (%%); default 3",
     )
     p.add_argument("--notional", type=float, default=10_000.0)
+    p.add_argument(
+        "--max-session-loss",
+        type=float,
+        default=100.0,
+        help="Exit when session PnL hits this loss ($); 0 = off",
+    )
     p.add_argument("--data-folder", default=None)
     p.add_argument("--output", default="backtest_daily_overreact.html")
     p.add_argument("--no-browser", action="store_true")
@@ -637,6 +752,7 @@ def main() -> None:
     params = DailyOverreactParams(
         threshold_pct=args.threshold,
         notional=args.notional,
+        max_session_loss=args.max_session_loss,
     )
 
     print(f"Loading {args.ticker_a}/{args.ticker_b} ({args.start}–{args.end}) …")
