@@ -423,7 +423,7 @@ def _map_session_beta_ma(
     beta_col: str,
     windows: list[int],
 ) -> pd.DataFrame:
-    """Rolling mean of per-session β over prior sessions (inclusive)."""
+    """Rolling mean of per-session β over prior sessions only (excludes current day)."""
     if not windows:
         return sub
 
@@ -434,7 +434,9 @@ def _map_session_beta_ma(
     )
     for w in windows:
         ma_col = f"_beta_ma{w}"
-        daily[ma_col] = daily[beta_col].rolling(window=w, min_periods=1).mean()
+        daily[ma_col] = (
+            daily[beta_col].rolling(window=w, min_periods=1).mean().shift(1)
+        )
 
     lut = daily.set_index("Trading date")
     out = sub.copy()
@@ -611,7 +613,7 @@ def beta_price_spread_figure(
                     x=beta_sub["DT"],
                     y=beta_sub[ma_col],
                     mode="lines",
-                    name=f"{beta_label} MA{w} (sessions)",
+                    name=f"{beta_label} MA{w} (prior sessions)",
                     line=dict(width=ma_width, color=color, dash="dash"),
                 ),
                 row=row,
