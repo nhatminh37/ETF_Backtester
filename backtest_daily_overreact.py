@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Daily overreaction mean-reversion — directional PAAS only (no SLV hedge).
+Daily overreaction — quadrant rules on spread × PAAS direction.
 
-Signal (known before today's open on session *t*):
-  1. β_signal = OLS on daily returns from sessions *t−21 … t−2* (20 days, excludes yesterday).
-  2. Yesterday (*t−1*) hedged return:
-     diff_ret = r_PAAS − β_signal×r_SLV  (close vs prior close).
-  3. **Overreacted** if diff_ret > +threshold → **short PAAS** today.
-     **Underreacted** if diff_ret < −threshold → **long PAAS** today.
+Signal (session *t*, from prior day *t−1*):
+  β_signal = OLS on daily returns *t−21 … t−2*.
+  diff_ret = r_PAAS − β_signal×r_SLV  (yesterday's hedged return).
+  PAAS direction = sign of yesterday's r_PAAS.
 
-Execution (session *t*):
-  Enter **9:30** open; exit **EOD** or when session PnL hits **−$100** loss cap.
-  **$10k notional on PAAS only** (no β hedge leg).
+Trade today ($10k single leg, no hedge):
+
+  **Large spread** (diff_ret > +threshold):
+    PAAS up   → short PAAS  (PAAS overbought)
+    PAAS down → long SLV    (SLV oversold)
+
+  **Small spread** (diff_ret < −threshold):
+    PAAS up   → short SLV   (SLV overbought)
+    PAAS down → long PAAS   (PAAS oversold)
+
+Enter 9:30; exit EOD or −$100 session loss cap.
 
 Usage::
 
@@ -57,7 +63,7 @@ def _leg_breakdown(
     price_entry: float,
     price_exit: float,
 ) -> dict:
-    """Single-leg PAAS book: $notional long or short."""
+    """Single-leg book: $notional long or short one ticker."""
     shares = notional / price_entry if price_entry else 0.0
 
     if side == "long":
@@ -126,6 +132,73 @@ def _scale_leg_pnl(legs: dict, capped_total: float) -> dict:
     return out
 
 
+def _paas_direction_label(r_a: float) -> str | None:
+    if r_a > 0:
+        return "up"
+    if r_a < 0:
+        return "down"
+    return None
+
+
+def resolve_quadrant_trade(
+    diff_ret: float,
+    r_a: float,
+    threshold: float,
+    ticker_a: str,
+    ticker_b: str,
+) -> dict | None:
+    """
+    Map (spread, PAAS direction) → side, ticker, labels.
+
+    Returns None if |diff_ret| below threshold or PAAS flat yesterday.
+    """
+    paas_dir = _paas_direction_label(r_a)
+    if paas_dir is None:
+        return None
+
+    if diff_ret > threshold:
+        spread_regime = "large_spread"
+        if paas_dir == "up":
+            return {
+                "side": "short",
+                "trade_ticker": ticker_a,
+                "signal_flag": "large_spread_paas_up",
+                "trade_rule": f"PAAS overbought → short {ticker_a}",
+                "spread_regime": spread_regime,
+                "paas_dir": paas_dir,
+            }
+        return {
+            "side": "long",
+            "trade_ticker": ticker_b,
+            "signal_flag": "large_spread_paas_down",
+            "trade_rule": f"SLV oversold → long {ticker_b}",
+            "spread_regime": spread_regime,
+            "paas_dir": paas_dir,
+        }
+
+    if diff_ret < -threshold:
+        spread_regime = "small_spread"
+        if paas_dir == "up":
+            return {
+                "side": "short",
+                "trade_ticker": ticker_b,
+                "signal_flag": "small_spread_paas_up",
+                "trade_rule": f"SLV overbought → short {ticker_b}",
+                "spread_regime": spread_regime,
+                "paas_dir": paas_dir,
+            }
+        return {
+            "side": "long",
+            "trade_ticker": ticker_a,
+            "signal_flag": "small_spread_paas_down",
+            "trade_rule": f"PAAS oversold → long {ticker_a}",
+            "spread_regime": spread_regime,
+            "paas_dir": paas_dir,
+        }
+
+    return None
+
+
 def build_signal_panel(
     panel: pd.DataFrame,
     ticker_a: str,
@@ -166,6 +239,7 @@ def build_signal_panel(
                 "Signal_r_a_pct": round(r_a * 100, 4),
                 "Signal_r_b_pct": round(r_b * 100, 4),
                 "Signal_diff_ret_pct": round(diff_ret * 100, 4),
+                "Signal_paas_dir": _paas_direction_label(r_a),
             }
         )
 
@@ -174,24 +248,24 @@ def build_signal_panel(
 
 def _session_entry(
     panel: pd.DataFrame,
-    ticker_a: str,
+    ticker: str,
     td: int,
 ) -> dict | None:
     day = panel.loc[panel["Trading date"] == td].sort_values("DT")
-    if day.empty:
+    if day.empty or ticker not in day.columns:
         return None
 
     open_mask = (day["DT"].dt.hour == OPEN_HOUR) & (day["DT"].dt.minute == OPEN_MINUTE)
     open_row = day.loc[open_mask].iloc[0] if open_mask.any() else day.iloc[0]
     return {
         "entry_dt": open_row["DT"],
-        "entry_price": float(open_row[ticker_a]),
+        "entry_price": float(open_row[ticker]),
     }
 
 
 def _resolve_intraday_exit(
     panel: pd.DataFrame,
-    ticker_a: str,
+    trade_ticker: str,
     td: int,
     *,
     side: str,
@@ -202,7 +276,7 @@ def _resolve_intraday_exit(
 ) -> dict | None:
     """Walk 1-min bars; exit on session loss cap or EOD."""
     day = panel.loc[panel["Trading date"] == td].sort_values("DT")
-    if day.empty:
+    if day.empty or trade_ticker not in day.columns:
         return None
 
     session_pnl = 0.0
@@ -211,14 +285,14 @@ def _resolve_intraday_exit(
         return None
 
     for _, bar in after_entry.iterrows():
-        mark = float(bar[ticker_a])
+        mark = float(bar[trade_ticker])
         unrealized = _position_pnl_usd(
-            side, notional, ticker_a, entry_price, mark
+            side, notional, trade_ticker, entry_price, mark
         )
         if max_session_loss > 0 and session_pnl + unrealized <= -max_session_loss:
             raw_pnl = unrealized
             capped_pnl = _cap_session_pnl(session_pnl, raw_pnl, max_session_loss)
-            legs = _leg_breakdown(side, notional, ticker_a, entry_price, mark)
+            legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
             reason = "Session loss cap"
             if abs(capped_pnl - raw_pnl) > 1e-9:
                 legs = _scale_leg_pnl(legs, capped_pnl)
@@ -232,8 +306,8 @@ def _resolve_intraday_exit(
             }
 
     close_row = day.iloc[-1]
-    mark = float(close_row[ticker_a])
-    legs = _leg_breakdown(side, notional, ticker_a, entry_price, mark)
+    mark = float(close_row[trade_ticker])
+    legs = _leg_breakdown(side, notional, trade_ticker, entry_price, mark)
     return {
         "exit_dt": close_row["DT"],
         "exit_price": mark,
@@ -256,25 +330,22 @@ def run_backtest(
 
     for _, row in signals.iterrows():
         diff = float(row["Signal_diff_ret_pct"]) / 100.0
-        if diff > thresh:
-            side = "short"
-            flag = "overreacted"
-        elif diff < -thresh:
-            side = "long"
-            flag = "underreacted"
-        else:
+        r_a = float(row["Signal_r_a_pct"]) / 100.0
+        plan = resolve_quadrant_trade(diff, r_a, thresh, ticker_a, ticker_b)
+        if plan is None:
             continue
 
         td = int(row["Trading date"])
-        entry = _session_entry(panel, ticker_a, td)
+        trade_ticker = plan["trade_ticker"]
+        entry = _session_entry(panel, trade_ticker, td)
         if entry is None:
             continue
 
         exit_px = _resolve_intraday_exit(
             panel,
-            ticker_a,
+            trade_ticker,
             td,
-            side=side,
+            side=plan["side"],
             notional=p.notional,
             max_session_loss=p.max_session_loss,
             entry_dt=entry["entry_dt"],
@@ -292,17 +363,21 @@ def run_backtest(
             {
                 "Trade_id": trade_id,
                 "Signal_date": int(row["Signal_date"]),
-                "Signal_flag": flag,
+                "Signal_flag": plan["signal_flag"],
+                "Spread_regime": plan["spread_regime"],
+                "Signal_paas_dir": plan["paas_dir"],
+                "Trade_rule": plan["trade_rule"],
                 "Signal_diff_ret_pct": row["Signal_diff_ret_pct"],
                 "Beta_signal": round(float(row["beta_signal"]), 4),
-                "Side": side,
+                "Side": plan["side"],
+                "Trade_ticker": trade_ticker,
                 "Entry_date": td,
                 "Entry_time": pd.Timestamp(entry["entry_dt"]).strftime("%Y-%m-%d %H:%M"),
                 "Exit_date": td,
                 "Exit_time": pd.Timestamp(exit_px["exit_dt"]).strftime("%Y-%m-%d %H:%M"),
                 "Exit_reason": exit_px["exit_reason"],
-                f"Entry_{ticker_a}": round(entry["entry_price"], 4),
-                f"Exit_{ticker_a}": round(exit_px["exit_price"], 4),
+                "Entry_price": round(entry["entry_price"], 4),
+                "Exit_price": round(exit_px["exit_price"], 4),
                 "Return_pct": round(return_pct, 4),
                 "PnL_$": round(pnl_usd, 2),
                 "_legs": legs,
@@ -343,10 +418,15 @@ def summary_stats(
     wins = (trades_df["PnL_$"] > 0).sum()
     n = len(trades_df)
 
+    ta = trades_df["Trade_ticker"]
+    side = trades_df["Side"]
+
     rows = [
         ("Trades", n),
-        ("Long PAAS (underreacted)", int((trades_df["Side"] == "long").sum())),
-        ("Short PAAS (overreacted)", int((trades_df["Side"] == "short").sum())),
+        ("Long PAAS", int(((ta == ticker_a) & (side == "long")).sum())),
+        ("Short PAAS", int(((ta == ticker_a) & (side == "short")).sum())),
+        ("Long SLV", int(((ta == ticker_b) & (side == "long")).sum())),
+        ("Short SLV", int(((ta == ticker_b) & (side == "short")).sum())),
         ("Total PnL ($)", round(total, 2)),
         ("Avg return per trade (%)", round(trades_df["Return_pct"].mean(), 3)),
         ("Avg PnL per trade ($)", round(trades_df["PnL_$"].mean(), 2)),
@@ -355,7 +435,12 @@ def summary_stats(
         ("Worst trade ($)", round(trades_df["PnL_$"].min(), 2)),
         ("Signal β window", f"day −{SIGNAL_BETA_OFFSET_START} … −{SIGNAL_BETA_OFFSET_END}"),
         ("Signal metric", f"r_{ticker_a} − β_signal×r_{ticker_b} on prior session (%)"),
-        ("Position", f"Directional {ticker_a} only (${p.notional:,.0f}, no {ticker_b} hedge)"),
+        (
+            "Rules",
+            "large+PAAS↑→short A; large+PAAS↓→long B; "
+            "small+PAAS↑→short B; small+PAAS↓→long A",
+        ),
+        ("Position", f"Single leg ${p.notional:,.0f} on PAAS or SLV"),
         ("Threshold (%)", f"±{p.threshold_pct}"),
         ("Entry", "9:30 open"),
         ("Exit", "EOD or session loss cap"),
@@ -404,10 +489,12 @@ def _trades_table_html(trades_df: pd.DataFrame) -> str:
     cols = [
         "Trade_id",
         "Signal_date",
-        "Signal_flag",
+        "Spread_regime",
+        "Signal_paas_dir",
+        "Trade_ticker",
         "Side",
+        "Trade_rule",
         "Signal_diff_ret_pct",
-        "Beta_signal",
         "Entry_date",
         "Exit_reason",
         "Return_pct",
@@ -446,20 +533,25 @@ def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
             "Trade_id": int(row["Trade_id"]),
             "Signal_date": int(row["Signal_date"]),
             "Signal_flag": row["Signal_flag"],
+            "Spread_regime": row["Spread_regime"],
+            "Signal_paas_dir": row["Signal_paas_dir"],
+            "Trade_rule": row["Trade_rule"],
             "Signal_diff_ret_pct": float(row["Signal_diff_ret_pct"]),
             "Beta_signal": float(row["Beta_signal"]),
             "Side": row["Side"],
+            "Trade_ticker": row["Trade_ticker"],
             "Entry_date": int(row["Entry_date"]),
             "Entry_time": row["Entry_time"],
             "Exit_date": int(row["Exit_date"]),
             "Exit_time": row["Exit_time"],
             "Exit_reason": row["Exit_reason"],
-            f"Entry_{ticker_a}": float(row[f"Entry_{ticker_a}"]),
-            f"Exit_{ticker_a}": float(row[f"Exit_{ticker_a}"]),
+            "Entry_price": float(row["Entry_price"]),
+            "Exit_price": float(row["Exit_price"]),
             "Return_pct": float(row["Return_pct"]),
             "PnL_usd": float(row["PnL_$"]),
             "legs": row["_legs"],
             "ticker_a": ticker_a,
+            "ticker_b": ticker_b,
         }
     return json.dumps(out)
 
@@ -544,12 +636,13 @@ td {{ border: 1px solid #ddd; padding: 6px; }}
 {_trades_table_html(trades_df)}
 <h2 id="legs-title">Trade legs</h2>
 <div id="explainer">
-  <strong>Signal β</strong> (day −{SIGNAL_BETA_OFFSET_START}…−{SIGNAL_BETA_OFFSET_END}): OLS on daily returns.<br>
-  <strong>Yesterday diff_ret</strong> = r_{ticker_a} − β_signal×r_{ticker_b}.<br>
-  <strong>Overreacted</strong> (&gt; +{p.threshold_pct}%): PAAS rich vs β×{ticker_b} → <strong>SHORT {ticker_a}</strong> ${p.notional:,.0f}.<br>
-  <strong>Underreacted</strong> (&lt; −{p.threshold_pct}%): PAAS cheap → <strong>LONG {ticker_a}</strong> ${p.notional:,.0f}.<br>
-  No SLV hedge leg — directional {ticker_a} only.<br>
-  <strong>Exit:</strong> EOD, or intraday if mark-to-market PnL ≤ −${p.max_session_loss:.0f} (``--max-session-loss``).
+  <strong>Signal</strong> (prior session): diff_ret = r_{ticker_a} − β_signal×r_{ticker_b};
+  PAAS direction = sign(r_{ticker_a}).<br>
+  <strong>Large spread</strong> (diff_ret &gt; +{p.threshold_pct}%):<br>
+  &nbsp;• PAAS ↑ → <strong>short {ticker_a}</strong> &nbsp;• PAAS ↓ → <strong>long {ticker_b}</strong><br>
+  <strong>Small spread</strong> (diff_ret &lt; −{p.threshold_pct}%):<br>
+  &nbsp;• PAAS ↑ → <strong>short {ticker_b}</strong> &nbsp;• PAAS ↓ → <strong>long {ticker_a}</strong><br>
+  ${p.notional:,.0f} single leg; exit EOD or −${p.max_session_loss:.0f} session cap.
 </div>
 <p id="trade-meta">No trade selected.</p>
 <div id="legs-panel"><p>Select a trade above.</p></div>
@@ -575,10 +668,10 @@ function renderTrade(tradeId) {{
   const meta = document.getElementById('trade-meta');
   const panel = document.getElementById('legs-panel');
   const pnlTotal = t.PnL_usd;
-  title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' ' + t.ticker_a + ' (' + t.Signal_flag + ')';
+  title.textContent = 'Trade #' + t.Trade_id + ' — ' + t.Side.toUpperCase() + ' ' + t.Trade_ticker;
   meta.textContent =
-    'Signal ' + t.Signal_date + ' diff_ret ' + t.Signal_diff_ret_pct.toFixed(3) + '%'
-    + ' | β_signal ' + t.Beta_signal
+    t.Trade_rule + ' | signal ' + t.Signal_date
+    + ' diff_ret ' + t.Signal_diff_ret_pct.toFixed(3) + '% PAAS ' + t.Signal_paas_dir
     + ' | Entry ' + t.Entry_time + ' Exit ' + t.Exit_time
     + ' (' + t.Exit_reason + ')'
     + ' | PnL $' + pnlTotal.toFixed(2);
@@ -658,7 +751,7 @@ def _parse_args() -> argparse.Namespace:
     default_start = int((today - timedelta(days=365 * 2)).strftime("%Y%m%d"))
 
     p = argparse.ArgumentParser(
-        description="Daily overreaction: directional PAAS signal, open-to-EOD trade."
+        description="Daily overreaction: quadrant spread×PAAS-dir rules, open-to-EOD."
     )
     p.add_argument("--ticker-a", default="PAAS")
     p.add_argument("--ticker-b", default="SLV")
