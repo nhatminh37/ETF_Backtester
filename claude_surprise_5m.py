@@ -207,6 +207,18 @@ class TradeParams:
     include_open_gap: bool = True  # inject prior_close -> 9:30 open once
     adaptive_r: bool = True        # slow EWMA update of R from innovations
     r_lambda: float = 0.98         # R_t = λ R_{t-1} + (1-λ) e_t²
+    momentum: bool = False           # True = ride z; False = fade z (mean-revert)
+
+
+def signal_direction(z: float, momentum: bool) -> int:
+    """+1 = long PAAS/short SLV; −1 = short PAAS/long SLV."""
+    if momentum:
+        return -1 if z < 0 else 1
+    return 1 if z < 0 else -1
+
+
+def signal_mode_label(momentum: bool) -> str:
+    return "momentum" if momentum else "mean_revert"
 
 
 @dataclass
@@ -318,7 +330,7 @@ def _maybe_enter(
     if pos is not None or not trading_live or abs(kf.z) <= tp.entry_z:
         return pos, pending
 
-    direction = 1 if kf.z < 0 else -1
+    direction = signal_direction(kf.z, tp.momentum)
     if tp.same_bar_entry:
         opened = _open_position_from_signal(
             signal_time=dt,
@@ -496,6 +508,7 @@ def simulate_session(
                 fills.append({
                     "Trading date": td,
                     "Direction": "Long PAAS/Short SLV" if pos.direction == 1 else "Short PAAS/Long SLV",
+                    "Signal_mode": signal_mode_label(tp.momentum),
                     "Signal_time": pos.signal_time,
                     "Entry_time": pos.entry_time,
                     "Exit_time": dt,
@@ -608,6 +621,7 @@ def summary_stats(trades_df: pd.DataFrame, daily_df: pd.DataFrame, tp: TradePara
         ("Take profit (%)", tp.tp_pct),
         ("Entry delay (min)", "same bar" if tp.same_bar_entry else tp.entry_delay_minutes),
         ("Same-bar entry", "yes" if tp.same_bar_entry else "no"),
+        ("Signal mode", signal_mode_label(tp.momentum)),
         ("Entry slippage (%)", tp.slippage_pct),
         ("Entry slippage ($)", round(_entry_slippage_usd(tp.notional, tp.slippage_pct), 2)),
         ("Forgetting factor (mu)", mu),
@@ -792,6 +806,7 @@ a.reset-link {{ font-size: 13px; margin-left: 0.5rem; }}
   Prior: intraday-only 1-min returns (no overnight in OLS).<br>
   9:30: one prior_close→open gap into Kalman; then minute returns until 10:00 warm-up, then trading.<br>
   R: {"EWMA λ=" + str(tp.r_lambda) if tp.adaptive_r else "fixed R₀ all day"}.<br>
+  Signal mode: {"momentum (ride z)" if tp.momentum else "mean_revert (fade z)"}.<br>
   Entry: {"same bar close" if tp.same_bar_entry else f"signal → fill {tp.entry_delay_minutes} min later"}.
   Exit: same bar when TP/time/EOD hits.
 </div>
@@ -1003,6 +1018,11 @@ def _parse_args() -> argparse.Namespace:
         default=0.98,
         help="EWMA decay for adaptive R (higher = slower update)",
     )
+    p.add_argument(
+        "--momentum",
+        action="store_true",
+        help="Ride z (momentum) instead of fading z (mean-revert)",
+    )
     p.add_argument("--max-session-loss", type=float, default=0.0, help="0 = disabled")
     p.add_argument("--data-folder", default=None)
     p.add_argument("--output", default="kalman_pairs_backtest.html")
@@ -1024,6 +1044,7 @@ def main() -> None:
         include_open_gap=not args.no_open_gap,
         adaptive_r=not args.no_adaptive_r,
         r_lambda=args.r_lambda,
+        momentum=args.momentum,
     )
     folder = args.data_folder or Paths().min_folder
 
