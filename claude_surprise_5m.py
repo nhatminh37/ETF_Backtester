@@ -39,6 +39,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import webbrowser
 from dataclasses import dataclass, field
@@ -228,6 +229,66 @@ def _try_fill_pending_entry(
     )
 
 
+def _trade_legs(
+    pos: OpenPosition,
+    ticker_a: str,
+    ticker_b: str,
+    exit_a: float,
+    exit_b: float,
+) -> dict:
+    """Entry/exit leg snapshot for reporting."""
+    d = pos.direction
+    n_b = pos.shares_b * pos.price_b_entry
+    if d == 1:
+        entry_a_act, entry_b_act = "BUY", "SELL"
+        exit_a_act, exit_b_act = "SELL", "BUY"
+        pnl_a = pos.shares_a * (exit_a - pos.price_a_entry)
+        pnl_b = pos.shares_b * (pos.price_b_entry - exit_b)
+    else:
+        entry_a_act, entry_b_act = "SELL", "BUY"
+        exit_a_act, exit_b_act = "BUY", "SELL"
+        pnl_a = pos.shares_a * (pos.price_a_entry - exit_a)
+        pnl_b = pos.shares_b * (exit_b - pos.price_b_entry)
+
+    return {
+        "entry": [
+            {
+                "Ticker": ticker_a,
+                "Action": entry_a_act,
+                "Price": round(pos.price_a_entry, 4),
+                "Notional_usd": round(pos.shares_a * pos.price_a_entry, 2),
+                "Shares": round(pos.shares_a, 4),
+            },
+            {
+                "Ticker": ticker_b,
+                "Action": entry_b_act,
+                "Price": round(pos.price_b_entry, 4),
+                "Notional_usd": round(n_b, 2),
+                "Shares": round(pos.shares_b, 4),
+                "Beta": round(pos.beta_entry, 4),
+            },
+        ],
+        "exit": [
+            {
+                "Ticker": ticker_a,
+                "Action": exit_a_act,
+                "Price": round(exit_a, 4),
+                "Notional_usd": round(pos.shares_a * exit_a, 2),
+                "Shares": round(pos.shares_a, 4),
+            },
+            {
+                "Ticker": ticker_b,
+                "Action": exit_b_act,
+                "Price": round(exit_b, 4),
+                "Notional_usd": round(pos.shares_b * exit_b, 2),
+                "Shares": round(pos.shares_b, 4),
+            },
+        ],
+        "PnL_A_usd": round(pnl_a, 2),
+        "PnL_B_usd": round(pnl_b, 2),
+    }
+
+
 def simulate_session(
     day: pd.DataFrame,
     td: int,
@@ -303,18 +364,26 @@ def simulate_session(
 
             if reason:
                 session_pnl += pnl
+                legs = _trade_legs(pos, ticker_a, ticker_b, price_a, price_b)
                 fills.append({
                     "Trading date": td,
                     "Direction": "Long PAAS/Short SLV" if pos.direction == 1 else "Short PAAS/Long SLV",
                     "Signal_time": pos.signal_time,
                     "Entry_time": pos.entry_time,
                     "Exit_time": dt,
+                    f"Entry_{ticker_a}": legs["entry"][0]["Price"],
+                    f"Entry_{ticker_b}": legs["entry"][1]["Price"],
+                    f"Exit_{ticker_a}": legs["exit"][0]["Price"],
+                    f"Exit_{ticker_b}": legs["exit"][1]["Price"],
                     "Entry_z": round(pos.entry_z, 3),
                     "Beta_entry": round(pos.beta_entry, 4),
                     "Exit_reason": reason,
                     "Slippage_$": round(pos.entry_slippage_usd, 2),
+                    "PnL_A_$": legs["PnL_A_usd"],
+                    "PnL_B_$": legs["PnL_B_usd"],
                     "PnL_$": round(pnl, 2),
                     "PnL_pct": round(pnl_pct, 4),
+                    "_legs": legs,
                 })
                 pos = None
                 if tp.max_session_loss > 0 and session_pnl <= -tp.max_session_loss:
@@ -364,6 +433,10 @@ def run_backtest(
     if trades_df.empty:
         return trades_df, pd.DataFrame()
 
+    trades_df.insert(0, "Trade_id", range(1, len(trades_df) + 1))
+    for col in ("Signal_time", "Entry_time", "Exit_time"):
+        trades_df[col] = pd.to_datetime(trades_df[col]).dt.strftime("%Y-%m-%d %H:%M")
+
     daily_df = (
         trades_df.groupby("Trading date", as_index=False)
         .agg(Trades=("PnL_$", "count"), Session_PnL=("PnL_$", "sum"))
@@ -402,30 +475,328 @@ def summary_stats(trades_df: pd.DataFrame, daily_df: pd.DataFrame, tp: TradePara
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
 
+def _trading_dates_for_plot(daily_df: pd.DataFrame) -> pd.Series:
+    return pd.to_datetime(daily_df["Trading date"].astype(str), format="%Y%m%d")
+
+
+def _daily_table_html(daily_df: pd.DataFrame) -> str:
+    if daily_df.empty:
+        return "<p>No trades</p>"
+    cols = list(daily_df.columns)
+    parts = [
+        "<table id='daily-pnl-table' class='data-table interactive-table'>",
+        "<thead><tr>",
+        *[f"<th>{c}</th>" for c in cols],
+        "</tr></thead><tbody>",
+    ]
+    for _, row in daily_df.iterrows():
+        td = int(row["Trading date"])
+        parts.append(f"<tr class='daily-row' data-td='{td}' tabindex='0'>")
+        for c in cols:
+            val = row[c]
+            if c in ("Session_PnL_$", "Cum_PnL_$") and pd.notna(val):
+                text = f"{float(val):,.2f}"
+            else:
+                text = str(val)
+            parts.append(f"<td>{text}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _trades_table_html(trades_df: pd.DataFrame) -> str:
+    if trades_df.empty:
+        return "<p>No trades</p>"
+    cols = [
+        "Trade_id",
+        "Trading date",
+        "Direction",
+        "Signal_time",
+        "Entry_time",
+        "Exit_time",
+        "Entry_z",
+        "Beta_entry",
+        "Exit_reason",
+        "Slippage_$",
+        "PnL_$",
+        "PnL_pct",
+    ]
+    parts = [
+        "<table id='trades-table' class='data-table interactive-table'>",
+        "<thead><tr>",
+        *[f"<th>{c}</th>" for c in cols],
+        "</tr></thead><tbody>",
+    ]
+    for _, row in trades_df.iterrows():
+        tid = int(row["Trade_id"])
+        td = int(row["Trading date"])
+        parts.append(
+            f"<tr class='trade-row' data-trade='{tid}' data-td='{td}' tabindex='0'>"
+        )
+        for c in cols:
+            val = row[c]
+            if c in ("PnL_$", "Slippage_$") and pd.notna(val):
+                text = f"{float(val):,.2f}"
+            elif c == "PnL_pct" and pd.notna(val):
+                text = f"{float(val):,.4f}"
+            elif c in ("Entry_z", "Beta_entry") and pd.notna(val):
+                text = f"{float(val):,.4f}"
+            else:
+                text = str(val)
+            parts.append(f"<td>{text}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _trades_json(trades_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
+    if trades_df.empty:
+        return "{}"
+    out: dict[str, dict] = {}
+    for _, row in trades_df.iterrows():
+        tid = str(int(row["Trade_id"]))
+        out[tid] = {
+            "Trade_id": int(row["Trade_id"]),
+            "Trading_date": int(row["Trading date"]),
+            "Direction": row["Direction"],
+            "Signal_time": row["Signal_time"],
+            "Entry_time": row["Entry_time"],
+            "Exit_time": row["Exit_time"],
+            f"Entry_{ticker_a}": float(row[f"Entry_{ticker_a}"]),
+            f"Entry_{ticker_b}": float(row[f"Entry_{ticker_b}"]),
+            f"Exit_{ticker_a}": float(row[f"Exit_{ticker_a}"]),
+            f"Exit_{ticker_b}": float(row[f"Exit_{ticker_b}"]),
+            "Entry_z": float(row["Entry_z"]),
+            "Beta_entry": float(row["Beta_entry"]),
+            "Exit_reason": row["Exit_reason"],
+            "Slippage_usd": float(row["Slippage_$"]),
+            "PnL_A_usd": float(row["PnL_A_$"]),
+            "PnL_B_usd": float(row["PnL_B_$"]),
+            "PnL_usd": float(row["PnL_$"]),
+            "PnL_pct": float(row["PnL_pct"]),
+            "legs": row["_legs"],
+            "ticker_a": ticker_a,
+            "ticker_b": ticker_b,
+        }
+    return json.dumps(out)
+
+
+def _trades_by_td_json(trades_df: pd.DataFrame) -> str:
+    if trades_df.empty:
+        return "{}"
+    grouped: dict[str, list[int]] = {}
+    for _, row in trades_df.iterrows():
+        td = str(int(row["Trading date"]))
+        grouped.setdefault(td, []).append(int(row["Trade_id"]))
+    return json.dumps(grouped)
+
+
 def build_report_html(summary: pd.DataFrame, trades_df: pd.DataFrame, daily_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
     fig = make_subplots(rows=2, cols=1, row_heights=[0.45, 0.55], vertical_spacing=0.08)
     if not daily_df.empty:
-        x = pd.to_datetime(daily_df["Trading date"].astype(str), format="%Y%m%d")
+        x = _trading_dates_for_plot(daily_df)
         fig.add_trace(go.Bar(x=x, y=daily_df["Session_PnL_$"], name="Daily PnL"), row=1, col=1)
         fig.add_trace(go.Scatter(x=x, y=daily_df["Cum_PnL_$"], mode="lines", name="Cum PnL"), row=2, col=1)
     fig.update_layout(template="plotly_white", height=700, title=f"Kalman hedge-ratio pairs — {ticker_a} vs {ticker_b}")
     chart = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="pnl-chart")
 
-    trades_html = trades_df.to_html(index=False, border=0) if not trades_df.empty else "<p>No trades</p>"
+    td_dates = (
+        {
+            str(int(td)): pd.to_datetime(str(int(td)), format="%Y%m%d").strftime("%Y-%m-%d")
+            for td in daily_df["Trading date"].unique()
+        }
+        if not daily_df.empty
+        else {}
+    )
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Kalman Pairs Backtest</title>
 <style>
 body {{ font-family: sans-serif; margin: 2rem; }}
-h1,h2 {{ color: #0066cc; }}
+h1,h2,h3 {{ color: #0066cc; }}
 table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
-th {{ background: #0066cc; color: white; padding: 6px; }}
+th {{ background: #0066cc; color: white; padding: 6px; text-align: left; }}
 td {{ border: 1px solid #ddd; padding: 6px; }}
+.interactive-table tbody tr.daily-row,
+.interactive-table tbody tr.trade-row {{ cursor: pointer; }}
+.interactive-table tbody tr:hover {{ background: #eef6ff; }}
+.interactive-table tbody tr.selected {{ background: #cce0ff; font-weight: 600; }}
+.interactive-table tbody tr.day-match {{ background: #f0f7ff; }}
+#explainer {{ background: #f7f9fc; border-left: 4px solid #0066cc; padding: 0.75rem 1rem; margin: 0.5rem 0 1rem; font-size: 13px; }}
+#day-trades-panel table {{ margin-top: 0.5rem; }}
+a.reset-link {{ font-size: 13px; margin-left: 0.5rem; }}
 </style></head><body>
 <h1>Kalman hedge-ratio pairs — {ticker_a} vs {ticker_b}</h1>
 <h2>Summary</h2>{summary.to_html(index=False, border=0)}
 <div>{chart}</div>
-<h2>Trades</h2>{trades_html}
+<h2>Daily PnL</h2>
+<p>Click a day row or chart bar to show all trades for that session. Click a trade for detail.</p>
+{_daily_table_html(daily_df)}
+<h2>Trades <a href="#" class="reset-link" id="show-all-trades">(show all)</a></h2>
+{_trades_table_html(trades_df)}
+<h2 id="detail-title">Trade detail</h2>
+<div id="explainer">
+  Kalman z-score pairs on 1-min bars. Signal bar → entry next bar close. Flat slippage deducted from PnL.
+</div>
+<p id="trade-meta">Select a trade or day.</p>
+<div id="day-trades-panel"></div>
+<div id="trade-detail-panel"></div>
+<script>
+const TRADES = {_trades_json(trades_df, ticker_a, ticker_b)};
+const TRADES_BY_TD = {_trades_by_td_json(trades_df)};
+const TD_LABELS = {json.dumps(td_dates)};
+const TA = {json.dumps(ticker_a)};
+const TB = {json.dumps(ticker_b)};
+
+function formatMoney(v) {{
+  return (v >= 0 ? '' : '-') + '$' + Math.abs(v).toFixed(2);
+}}
+
+function legTable(title, timeLabel, legs) {{
+  let html = '<h3>' + title + ' (' + timeLabel + ')</h3>';
+  html += '<table class="data-table"><thead><tr>'
+    + '<th>Ticker</th><th>Action</th><th>Fill price</th><th>Notional $</th><th>Shares</th><th>β</th>'
+    + '</tr></thead><tbody>';
+  for (const leg of legs) {{
+    html += '<tr><td>' + leg.Ticker + '</td><td>' + leg.Action + '</td><td>' + leg.Price
+      + '</td><td>' + leg.Notional_usd + '</td><td>' + leg.Shares
+      + '</td><td>' + (leg.Beta != null ? leg.Beta : '—') + '</td></tr>';
+  }}
+  return html + '</tbody></table>';
+}}
+
+function renderTradeDetail(tradeId) {{
+  const t = TRADES[String(tradeId)];
+  if (!t) return;
+  document.getElementById('detail-title').textContent = 'Trade #' + t.Trade_id;
+  document.getElementById('trade-meta').textContent =
+    t.Direction + ' | signal ' + t.Signal_time + ' → entry ' + t.Entry_time
+    + ' → exit ' + t.Exit_time + ' (' + t.Exit_reason + ')'
+    + ' | z=' + t.Entry_z.toFixed(3) + ' β=' + t.Beta_entry.toFixed(4)
+    + ' | slippage ' + formatMoney(-t.Slippage_usd) + ' | PnL ' + formatMoney(t.PnL_usd)
+    + ' (' + t.PnL_pct.toFixed(3) + '%)';
+  let html = legTable('Entry fill', t.Entry_time, t.legs.entry);
+  html += legTable('Exit fill', t.Exit_time, t.legs.exit);
+  html += '<table class="data-table"><thead><tr><th>Leg</th><th>PnL $</th></tr></thead><tbody>'
+    + '<tr><td>' + TA + '</td><td>' + formatMoney(t.PnL_A_usd) + '</td></tr>'
+    + '<tr><td>' + TB + '</td><td>' + formatMoney(t.PnL_B_usd) + '</td></tr>'
+    + '<tr><td>Slippage</td><td>' + formatMoney(-t.Slippage_usd) + '</td></tr>'
+    + '<tr><td><b>Total</b></td><td><b>' + formatMoney(t.PnL_usd) + '</b></td></tr>'
+    + '</tbody></table>';
+  document.getElementById('trade-detail-panel').innerHTML = html;
+}}
+
+function renderDayTrades(td, focusTradeId) {{
+  const ids = TRADES_BY_TD[String(td)] || [];
+  const label = TD_LABELS[String(td)] || td;
+  document.getElementById('detail-title').textContent =
+    ids.length ? ('Trades on ' + label + ' (' + ids.length + ')') : ('Trades on ' + label);
+  let dayPnl = 0;
+  let html = '<table class="data-table"><thead><tr>'
+    + '<th>#</th><th>Direction</th><th>Entry</th><th>Exit</th><th>Reason</th><th>PnL $</th>'
+    + '</tr></thead><tbody>';
+  ids.forEach(id => {{
+    const t = TRADES[String(id)];
+    dayPnl += t.PnL_usd;
+    const sel = String(id) === String(focusTradeId) ? ' class="selected"' : '';
+    html += '<tr class="day-trade-row"' + sel + ' data-trade="' + id + '" style="cursor:pointer">'
+      + '<td>#' + t.Trade_id + '</td>'
+      + '<td>' + t.Direction + '</td>'
+      + '<td>' + t.Entry_time + '</td>'
+      + '<td>' + t.Exit_time + '</td>'
+      + '<td>' + t.Exit_reason + '</td>'
+      + '<td>' + formatMoney(t.PnL_usd) + '</td>'
+      + '</tr>';
+  }});
+  html += '</tbody></table>';
+  if (ids.length) {{
+    html += '<p><b>Day total:</b> ' + formatMoney(dayPnl) + '</p>';
+  }} else {{
+    html = '<p>No trades for this date.</p>';
+  }}
+  document.getElementById('day-trades-panel').innerHTML = html;
+  document.getElementById('trade-meta').textContent =
+    ids.length ? (ids.length + ' trade(s) on ' + label) : 'No trades for this date.';
+  document.querySelectorAll('.day-trade-row').forEach(row => {{
+    row.addEventListener('click', () => selectTrade(row.dataset.trade, false));
+  }});
+  if (focusTradeId) renderTradeDetail(focusTradeId);
+  else document.getElementById('trade-detail-panel').innerHTML = '';
+}}
+
+function setTradeFilter(td) {{
+  document.querySelectorAll('.trade-row').forEach(tr => {{
+    const match = !td || tr.dataset.td === String(td);
+    tr.style.display = match ? '' : 'none';
+    tr.classList.toggle('day-match', !!td && match);
+    tr.classList.remove('selected');
+  }});
+}}
+
+function setDailySelection(td) {{
+  document.querySelectorAll('.daily-row').forEach(tr => {{
+    tr.classList.toggle('selected', !!td && tr.dataset.td === String(td));
+  }});
+}}
+
+function selectDaily(td, focusTradeId) {{
+  setDailySelection(td);
+  setTradeFilter(td);
+  renderDayTrades(td, focusTradeId);
+  if (focusTradeId) {{
+    document.querySelectorAll('.trade-row').forEach(tr => {{
+      tr.classList.toggle('selected', tr.dataset.trade === String(focusTradeId));
+    }});
+  }}
+  document.getElementById('day-trades-panel').scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+}}
+
+function selectTrade(tradeId, scroll) {{
+  const t = TRADES[String(tradeId)];
+  if (!t) return;
+  selectDaily(t.Trading_date, tradeId);
+  if (scroll !== false) {{
+    document.getElementById('trade-detail-panel').scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+  }}
+}}
+
+function showAllTrades() {{
+  setDailySelection(null);
+  setTradeFilter(null);
+  document.getElementById('detail-title').textContent = 'Trade detail';
+  document.getElementById('trade-meta').textContent = 'Showing all trades.';
+  document.getElementById('day-trades-panel').innerHTML = '';
+  document.getElementById('trade-detail-panel').innerHTML = '';
+}}
+
+document.querySelectorAll('.trade-row').forEach(tr => {{
+  tr.addEventListener('click', () => selectTrade(tr.dataset.trade));
+}});
+document.querySelectorAll('.daily-row').forEach(tr => {{
+  tr.addEventListener('click', () => selectDaily(tr.dataset.td, null));
+}});
+document.getElementById('show-all-trades').addEventListener('click', e => {{
+  e.preventDefault();
+  showAllTrades();
+}});
+
+const chartEl = document.getElementById('pnl-chart');
+if (chartEl) {{
+  chartEl.on('plotly_click', ev => {{
+    if (!ev.points || !ev.points.length) return;
+    const d = new Date(ev.points[0].x);
+    const td = String(d.getFullYear())
+      + String(d.getMonth() + 1).padStart(2, '0')
+      + String(d.getDate()).padStart(2, '0');
+    selectDaily(td, null);
+  }});
+}}
+
+if (Object.keys(TRADES).length) {{
+  const lastId = Object.keys(TRADES).sort((a, b) => Number(a) - Number(b)).pop();
+  selectTrade(lastId);
+}}
+</script>
 </body></html>"""
 
 
