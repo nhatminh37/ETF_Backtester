@@ -5,8 +5,12 @@ Kalman-filter hedge-ratio pairs trade on 1-min bars (SLV / PAAS).
 Three layers, kept strictly separate:
 
   Layer 0 — Offline prior (once/day, before open)
-      OLS  y = beta*x + eps  over last N historical trading days
-      -> beta0, P0 (inflated), R0 (frozen residual variance for the day)
+      OLS  y = beta*x + eps  over last N sessions of **intraday-only**
+      1-min returns (no overnight jumps in the sample) -> beta0, P0, R0
+
+  Layer 1 — Online filter (every minute from 9:30; observation until 10:00)
+      First step: optional prior_close -> 9:30 open gap (once)
+      Then minute returns; R0 fixed or slow EWMA update (--adaptive-r)
 
   Layer 1 — Online filter (runs every single minute, all session,
             regardless of trade state; this is the "brain")
@@ -21,8 +25,9 @@ Three layers, kept strictly separate:
 
   Layer 2 — Trade state machine (gated overlay, only "live" after
             the observation window; entries only fire post 10:00)
-      FLAT        -> on |z| > entry_z: queue entry for next bar close
-                     (e.g. signal 10:07 -> fill 10:08); flat slippage cost on PnL
+      FLAT        -> on |z| > entry_z at bar *t* close (return t−1→t, β from t−1):
+                     ``--same-bar-entry``: fill at bar *t* close (minimal delay)
+                     else queue fill ``--entry-delay-minutes`` later (default next bar)
       IN_POSITION -> mark-to-market P&L from entry prices (NOT an
                      accumulator of per-bar residuals). Exit on:
                        1) pnl_pct >= tp_pct        ("TP")
@@ -69,6 +74,30 @@ class Prior:
     R0: float
 
 
+def _pool_intraday_returns(
+    sub: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Within-session 1-min returns only; no overnight bars in the sample."""
+    xs: list[float] = []
+    ys: list[float] = []
+
+    for _, group in sub.groupby("Trading date"):
+        g = group.sort_values("DT")
+        pa = g[ticker_a].to_numpy(dtype=float)
+        pb = g[ticker_b].to_numpy(dtype=float)
+        if len(pa) < 2:
+            continue
+        mask = (pa[:-1] > 0) & (pb[:-1] > 0) & (pa[1:] > 0) & (pb[1:] > 0)
+        if not mask.any():
+            continue
+        ys.extend((pa[1:][mask] / pa[:-1][mask]) - 1.0)
+        xs.extend((pb[1:][mask] / pb[:-1][mask]) - 1.0)
+
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+
+
 def fit_prior(
     hist: pd.DataFrame,
     ticker_a: str,
@@ -77,24 +106,12 @@ def fit_prior(
     p0_inflation: float = 5.0,
 ) -> Prior:
     """
-    OLS y = beta*x + eps over the trailing `lookback_days` sessions of
-    minute returns (pooled across days), evaluated as-of the day the
-    caller has already sliced `hist` down to (i.e. hist should already
-    exclude the current/live session).
-
-    p0_inflation: OLS SE^2 on beta understates day-to-day beta
-    instability (it's *within-sample* sampling error, not the variance
-    of beta drifting session to session). We scale it up so the filter
-    isn't overconfident on day 1. Tune this against your own data by
-    comparing OLS SE^2 to the empirical variance of rolling daily betas.
+    OLS y = beta*x + eps over trailing ``lookback_days`` sessions of
+    **intraday-only** minute returns. ``hist`` must exclude the live session.
     """
     days = sorted(hist["Trading date"].unique())[-lookback_days:]
     sub = hist[hist["Trading date"].isin(days)].sort_values("DT")
-
-    x = sub[ticker_b].pct_change().dropna()
-    y = sub[ticker_a].pct_change().dropna()
-    idx = x.index.intersection(y.index)
-    x, y = x.loc[idx].values, y.loc[idx].values
+    x, y = _pool_intraday_returns(sub, ticker_a, ticker_b)
 
     if len(x) < 30 or np.var(x) == 0:
         raise ValueError("Not enough historical data to fit a prior.")
@@ -103,10 +120,32 @@ def fit_prior(
     resid = y - beta0 * x
     n = len(x)
     R0 = float(np.sum(resid ** 2) / max(n - 1, 1))
-    se2_beta = R0 / np.dot(x, x)          # OLS variance of beta estimate
+    se2_beta = R0 / np.dot(x, x)
     P0 = float(se2_beta * p0_inflation)
 
     return Prior(beta0=beta0, P0=P0, R0=R0)
+
+
+def _prior_close_by_date(
+    panel: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+) -> dict[int, tuple[float, float]]:
+    """Map session *t* -> (prior_close_A, prior_close_B) from session *t-1*."""
+    closes = (
+        panel.sort_values("DT")
+        .groupby("Trading date")[[ticker_a, ticker_b]]
+        .last()
+    )
+    dates = [int(d) for d in closes.index]
+    out: dict[int, tuple[float, float]] = {}
+    for i in range(1, len(dates)):
+        prev_td, cur_td = dates[i - 1], dates[i]
+        pa = float(closes.loc[prev_td, ticker_a])
+        pb = float(closes.loc[prev_td, ticker_b])
+        if pa > 0 and pb > 0:
+            out[cur_td] = (pa, pb)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -117,10 +156,11 @@ def fit_prior(
 class KalmanState:
     beta: float
     P: float
-    R: float          # frozen for the session
-    mu: float          # forgetting factor, 0 < mu <= 1
+    R: float
+    mu: float
+    adaptive_r: bool = False
+    r_lambda: float = 0.98
 
-    # last-step diagnostics, useful for logging/plots
     z: float = field(default=0.0)
     e: float = field(default=0.0)
     S: float = field(default=0.0)
@@ -128,7 +168,6 @@ class KalmanState:
     def step(self, x: float, y: float) -> None:
         """One filter update. Runs every bar, unconditionally."""
         if x == 0.0:
-            # no information this bar; skip gracefully (K would be 0 anyway)
             self.z = 0.0
             self.e = y
             self.S = self.R
@@ -146,6 +185,10 @@ class KalmanState:
         self.e = e
         self.S = S
 
+        if self.adaptive_r:
+            lam = self.r_lambda
+            self.R = lam * self.R + (1.0 - lam) * (e * e)
+
 
 # --------------------------------------------------------------------------- #
 # Layer 2 — Trade state machine
@@ -158,8 +201,12 @@ class TradeParams:
     tp_pct: float = 1.0            # percent, e.g. 1.0 = 1%
     notional: float = 10_000.0
     max_session_loss: float = 0.0  # 0 = disabled; set >0 (in $) to enable
-    entry_delay_minutes: int = 1   # signal bar close -> fill N minutes later
+    entry_delay_minutes: int = 1   # delayed mode: minutes after signal bar close
     slippage_pct: float = 0.3      # flat entry cost = notional × slippage_pct / 100
+    same_bar_entry: bool = False   # True = signal and fill at same bar close
+    include_open_gap: bool = True  # inject prior_close -> 9:30 open once
+    adaptive_r: bool = True        # slow EWMA update of R from innovations
+    r_lambda: float = 0.98         # R_t = λ R_{t-1} + (1-λ) e_t²
 
 
 @dataclass
@@ -198,6 +245,34 @@ def _mark_to_market(pos: OpenPosition, price_a: float, price_b: float) -> float:
     return pnl_a + pnl_b - pos.entry_slippage_usd
 
 
+def _open_position_from_signal(
+    *,
+    signal_time: pd.Timestamp,
+    direction: int,
+    beta_entry: float,
+    entry_z: float,
+    price_a: float,
+    price_b: float,
+    tp: TradeParams,
+) -> OpenPosition | None:
+    if price_a <= 0 or price_b <= 0:
+        return None
+    shares_a = tp.notional / price_a
+    shares_b = tp.notional * beta_entry / price_b
+    return OpenPosition(
+        direction=direction,
+        signal_time=signal_time,
+        entry_time=signal_time,
+        beta_entry=beta_entry,
+        price_a_entry=price_a,
+        price_b_entry=price_b,
+        shares_a=shares_a,
+        shares_b=shares_b,
+        entry_z=entry_z,
+        entry_slippage_usd=_entry_slippage_usd(tp.notional, tp.slippage_pct),
+    )
+
+
 def _try_fill_pending_entry(
     *,
     pending: PendingEntry,
@@ -227,6 +302,42 @@ def _try_fill_pending_entry(
         entry_z=pending.entry_z,
         entry_slippage_usd=_entry_slippage_usd(tp.notional, tp.slippage_pct),
     )
+
+
+def _maybe_enter(
+    *,
+    pos: OpenPosition | None,
+    pending: PendingEntry | None,
+    dt: pd.Timestamp,
+    price_a: float,
+    price_b: float,
+    kf: KalmanState,
+    trading_live: bool,
+    tp: TradeParams,
+) -> tuple[OpenPosition | None, PendingEntry | None]:
+    if pos is not None or not trading_live or abs(kf.z) <= tp.entry_z:
+        return pos, pending
+
+    direction = 1 if kf.z < 0 else -1
+    if tp.same_bar_entry:
+        opened = _open_position_from_signal(
+            signal_time=dt,
+            direction=direction,
+            beta_entry=kf.beta,
+            entry_z=kf.z,
+            price_a=price_a,
+            price_b=price_b,
+            tp=tp,
+        )
+        return (opened, None) if opened is not None else (pos, pending)
+
+    pending = PendingEntry(
+        signal_time=dt,
+        direction=direction,
+        beta_entry=kf.beta,
+        entry_z=kf.z,
+    )
+    return pos, pending
 
 
 def _trade_legs(
@@ -297,13 +408,21 @@ def simulate_session(
     prior: Prior,
     mu: float,
     tp: TradeParams,
+    prior_close: tuple[float, float] | None = None,
 ) -> list[dict]:
     """
     Runs Layer 1 (filter) every bar of the session, unconditionally.
     Runs Layer 2 (trade gate) only once the observation window has
     elapsed (bars at/after OBS_END_TIME).
     """
-    kf = KalmanState(beta=prior.beta0, P=prior.P0, R=prior.R0, mu=mu)
+    kf = KalmanState(
+        beta=prior.beta0,
+        P=prior.P0,
+        R=prior.R0,
+        mu=mu,
+        adaptive_r=tp.adaptive_r,
+        r_lambda=tp.r_lambda,
+    )
 
     obs_cutoff = pd.Timestamp(f"{day['DT'].iloc[0].date()} {OBS_END_TIME}")
     fills: list[dict] = []
@@ -322,8 +441,8 @@ def simulate_session(
         price_b = float(row[ticker_b])
         trading_live = dt >= obs_cutoff and not session_halted
 
-        # ---- Layer 2: fill queued entry at next bar close ----
-        if pos is None and pending is not None and trading_live:
+        # ---- Layer 2: delayed entry fill (skipped in same-bar mode) ----
+        if not tp.same_bar_entry and pos is None and pending is not None and trading_live:
             filled = _try_fill_pending_entry(
                 pending=pending,
                 dt=dt,
@@ -336,6 +455,15 @@ def simulate_session(
                 pending = None
 
         if prev_a is None:
+            if (
+                tp.include_open_gap
+                and prior_close is not None
+                and prior_close[0] > 0
+                and prior_close[1] > 0
+            ):
+                x_gap = price_b / prior_close[1] - 1.0
+                y_gap = price_a / prior_close[0] - 1.0
+                kf.step(x_gap, y_gap)
             prev_a, prev_b = price_a, price_b
             continue
 
@@ -389,14 +517,17 @@ def simulate_session(
                 if tp.max_session_loss > 0 and session_pnl <= -tp.max_session_loss:
                     session_halted = True
 
-        # ---- Layer 2: queue entry on signal bar (fill arrives next bar) ----
-        if pos is None and trading_live and abs(kf.z) > tp.entry_z:
-            pending = PendingEntry(
-                signal_time=dt,
-                direction=1 if kf.z < 0 else -1,
-                beta_entry=kf.beta,
-                entry_z=kf.z,
-            )
+        # ---- Layer 2: entry signal at bar t close (after kf.step on return t-1→t) ----
+        pos, pending = _maybe_enter(
+            pos=pos,
+            pending=pending,
+            dt=dt,
+            price_a=price_a,
+            price_b=price_b,
+            kf=kf,
+            trading_live=trading_live,
+            tp=tp,
+        )
 
     return fills
 
@@ -415,6 +546,7 @@ def run_backtest(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     all_fills: list[dict] = []
     dates = sorted(panel["Trading date"].unique())
+    prior_closes = _prior_close_by_date(panel, ticker_a, ticker_b)
 
     for idx, td in enumerate(dates):
         if idx < 5:
@@ -426,7 +558,16 @@ def run_backtest(
             continue
 
         day = panel[panel["Trading date"] == td]
-        fills = simulate_session(day, int(td), ticker_a, ticker_b, prior, mu, tp)
+        fills = simulate_session(
+            day,
+            int(td),
+            ticker_a,
+            ticker_b,
+            prior,
+            mu,
+            tp,
+            prior_close=prior_closes.get(int(td)),
+        )
         all_fills.extend(fills)
 
     trades_df = pd.DataFrame(all_fills)
@@ -465,10 +606,15 @@ def summary_stats(trades_df: pd.DataFrame, daily_df: pd.DataFrame, tp: TradePara
         ("Entry z threshold", tp.entry_z),
         ("Hold (min)", tp.hold_minutes),
         ("Take profit (%)", tp.tp_pct),
-        ("Entry delay (min)", tp.entry_delay_minutes),
+        ("Entry delay (min)", "same bar" if tp.same_bar_entry else tp.entry_delay_minutes),
+        ("Same-bar entry", "yes" if tp.same_bar_entry else "no"),
         ("Entry slippage (%)", tp.slippage_pct),
         ("Entry slippage ($)", round(_entry_slippage_usd(tp.notional, tp.slippage_pct), 2)),
         ("Forgetting factor (mu)", mu),
+        ("Prior", "intraday-only minute returns"),
+        ("Open gap at 9:30", "yes" if tp.include_open_gap else "no"),
+        ("Adaptive R", "yes" if tp.adaptive_r else "no"),
+        ("R EWMA lambda", tp.r_lambda if tp.adaptive_r else "n/a"),
         ("Notional/leg", tp.notional),
         ("Max session loss", tp.max_session_loss if tp.max_session_loss > 0 else "off"),
     ]
@@ -591,7 +737,14 @@ def _trades_by_td_json(trades_df: pd.DataFrame) -> str:
     return json.dumps(grouped)
 
 
-def build_report_html(summary: pd.DataFrame, trades_df: pd.DataFrame, daily_df: pd.DataFrame, ticker_a: str, ticker_b: str) -> str:
+def build_report_html(
+    summary: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    daily_df: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    tp: TradeParams,
+) -> str:
     fig = make_subplots(rows=2, cols=1, row_heights=[0.45, 0.55], vertical_spacing=0.08)
     if not daily_df.empty:
         x = _trading_dates_for_plot(daily_df)
@@ -636,7 +789,11 @@ a.reset-link {{ font-size: 13px; margin-left: 0.5rem; }}
 {_trades_table_html(trades_df)}
 <h2 id="detail-title">Trade detail</h2>
 <div id="explainer">
-  Kalman z-score pairs on 1-min bars. Signal bar → entry next bar close. Flat slippage deducted from PnL.
+  Prior: intraday-only 1-min returns (no overnight in OLS).<br>
+  9:30: one prior_close→open gap into Kalman; then minute returns until 10:00 warm-up, then trading.<br>
+  R: {"EWMA λ=" + str(tp.r_lambda) if tp.adaptive_r else "fixed R₀ all day"}.<br>
+  Entry: {"same bar close" if tp.same_bar_entry else f"signal → fill {tp.entry_delay_minutes} min later"}.
+  Exit: same bar when TP/time/EOD hits.
 </div>
 <p id="trade-meta">Select a trade or day.</p>
 <div id="day-trades-panel"></div>
@@ -814,16 +971,37 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--prior-lookback", type=int, default=60, help="Trading days used to fit beta0/P0/R0")
     p.add_argument("--notional", type=float, default=10_000.0)
     p.add_argument(
+        "--same-bar-entry",
+        action="store_true",
+        help="Signal and fill at same bar close (return t-1→t); minimal execution delay",
+    )
+    p.add_argument(
         "--entry-delay-minutes",
         type=int,
         default=1,
-        help="Minutes after signal bar close before entry fill (1 = next bar close)",
+        help="Delayed mode only: minutes after signal bar close before entry fill",
     )
     p.add_argument(
         "--slippage-pct",
         type=float,
         default=0.3,
         help="Flat entry cost as %% of notional (e.g. 0.3 -> $30 on $10k), deducted from PnL",
+    )
+    p.add_argument(
+        "--no-open-gap",
+        action="store_true",
+        help="Disable prior_close -> 9:30 open gap injection",
+    )
+    p.add_argument(
+        "--no-adaptive-r",
+        action="store_true",
+        help="Keep R fixed at R₀ all session (disable EWMA innovation update)",
+    )
+    p.add_argument(
+        "--r-lambda",
+        type=float,
+        default=0.98,
+        help="EWMA decay for adaptive R (higher = slower update)",
     )
     p.add_argument("--max-session-loss", type=float, default=0.0, help="0 = disabled")
     p.add_argument("--data-folder", default=None)
@@ -842,6 +1020,10 @@ def main() -> None:
         max_session_loss=args.max_session_loss,
         entry_delay_minutes=args.entry_delay_minutes,
         slippage_pct=args.slippage_pct,
+        same_bar_entry=args.same_bar_entry,
+        include_open_gap=not args.no_open_gap,
+        adaptive_r=not args.no_adaptive_r,
+        r_lambda=args.r_lambda,
     )
     folder = args.data_folder or Paths().min_folder
 
@@ -857,7 +1039,11 @@ def main() -> None:
 
     out = args.output
     with open(out, "w", encoding="utf-8") as f:
-        f.write(build_report_html(summary, trades_df, daily_df, args.ticker_a, args.ticker_b))
+        f.write(
+            build_report_html(
+                summary, trades_df, daily_df, args.ticker_a, args.ticker_b, tp
+            )
+        )
     print(f"\nReport: {out}")
 
     if not args.no_browser:
