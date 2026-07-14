@@ -17,11 +17,12 @@ Outputs:
   - Nyblom L_C constancy test (on β level)
   - CUSUM of demeaned β
   - ACF of β (and Δβ)
+  - Rolling 90% CI of β_10d (6m lookback of β's) → PAAS upper/lower paths vs actual
 
 Usage::
 
     python analyze_beta_stats.py --start 20240101 --end 20251231
-    python analyze_beta_stats.py --lookback 10 --ticker-a PAAS --ticker-b SLV
+    python analyze_beta_stats.py --lookback 10 --ci-window 126 --ci-level 0.90
 """
 
 from __future__ import annotations
@@ -151,6 +152,281 @@ def rolling_ols_beta(
     return pd.Series(betas, index=dates, name=f"beta_{lookback}d").dropna()
 
 
+def rolling_beta_ci(
+    beta: pd.Series,
+    window: int = 126,
+    level: float = 0.90,
+) -> pd.DataFrame:
+    """
+    Trailing empirical CI of β_t over the last ``window`` β observations.
+
+    For each t, take β_{t-window+1…t} and use percentiles
+    ((1-level)/2, (1+level)/2), e.g. 5%/95% for 90% CI.
+    """
+    if window < 10:
+        raise ValueError("ci window must be >= 10")
+    if not (0.5 < level < 1.0):
+        raise ValueError("ci level must be in (0.5, 1)")
+
+    lo_q = (1.0 - level) / 2.0 * 100.0
+    hi_q = (1.0 + level) / 2.0 * 100.0
+    vals = beta.to_numpy(dtype=float)
+    idx = beta.index.to_numpy()
+    n = len(vals)
+
+    beta_lo = np.full(n, np.nan)
+    beta_hi = np.full(n, np.nan)
+    beta_mid = np.full(n, np.nan)
+
+    for i in range(window - 1, n):
+        w = vals[i - window + 1 : i + 1]
+        w = w[np.isfinite(w)]
+        if len(w) < max(10, window // 4):
+            continue
+        beta_lo[i] = float(np.percentile(w, lo_q))
+        beta_hi[i] = float(np.percentile(w, hi_q))
+        beta_mid[i] = float(np.median(w))
+
+    out = pd.DataFrame(
+        {
+            "beta": vals,
+            "beta_ci_lo": beta_lo,
+            "beta_ci_hi": beta_hi,
+            "beta_ci_mid": beta_mid,
+        },
+        index=idx,
+    )
+    return out.dropna(subset=["beta_ci_lo", "beta_ci_hi"])
+
+
+def paas_paths_from_beta_ci(
+    rets: pd.DataFrame,
+    ci: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    reanchor_days: int = 0,
+) -> pd.DataFrame:
+    """
+    Map β CI endpoints into PAAS price paths via r_A ≈ β · r_B:
+
+      P̂_t(β) = P_anchor · exp( Σ_{s=anchor..t} β_s · r_{B,s} )
+
+    ``reanchor_days`` > 0 resets the anchor to actual PAAS every N sessions
+    (keeps bands near spot). ``0`` = single anchor at first CI date.
+    """
+    common = ci.index.intersection(rets.index)
+    if len(common) == 0:
+        return pd.DataFrame()
+
+    sub = rets.loc[common, [ticker_a, ticker_b, f"logret_{ticker_b}"]].copy()
+    sub["beta_ci_lo"] = ci.loc[common, "beta_ci_lo"]
+    sub["beta_ci_hi"] = ci.loc[common, "beta_ci_hi"]
+    sub["beta_ci_mid"] = ci.loc[common, "beta_ci_mid"]
+
+    paas = sub[ticker_a].to_numpy(dtype=float)
+    r_b = sub[f"logret_{ticker_b}"].to_numpy(dtype=float)
+    b_lo = sub["beta_ci_lo"].to_numpy(dtype=float)
+    b_hi = sub["beta_ci_hi"].to_numpy(dtype=float)
+    b_mid = sub["beta_ci_mid"].to_numpy(dtype=float)
+
+    n = len(sub)
+    p_lo = np.full(n, np.nan)
+    p_hi = np.full(n, np.nan)
+    p_mid = np.full(n, np.nan)
+
+    anchor = float(paas[0])
+    log_lo = 0.0
+    log_hi = 0.0
+    log_mid = 0.0
+    p_lo[0] = anchor
+    p_hi[0] = anchor
+    p_mid[0] = anchor
+
+    for i in range(1, n):
+        if reanchor_days > 0 and i % reanchor_days == 0:
+            anchor = float(paas[i])
+            log_lo = 0.0
+            log_hi = 0.0
+            log_mid = 0.0
+            p_lo[i] = anchor
+            p_hi[i] = anchor
+            p_mid[i] = anchor
+            continue
+
+        log_lo = log_lo + b_lo[i] * r_b[i]
+        log_hi = log_hi + b_hi[i] * r_b[i]
+        log_mid = log_mid + b_mid[i] * r_b[i]
+        p_lo[i] = anchor * float(np.exp(log_lo))
+        p_hi[i] = anchor * float(np.exp(log_hi))
+        p_mid[i] = anchor * float(np.exp(log_mid))
+
+    out = pd.DataFrame(
+        {
+            "PAAS": paas,
+            "PAAS_from_beta_lo": p_lo,
+            "PAAS_from_beta_hi": p_hi,
+            "PAAS_from_beta_mid": p_mid,
+            "PAAS_band_lo": np.minimum(p_lo, p_hi),
+            "PAAS_band_hi": np.maximum(p_lo, p_hi),
+            "beta_ci_lo": b_lo,
+            "beta_ci_hi": b_hi,
+            "beta_ci_mid": b_mid,
+            f"logret_{ticker_b}": r_b,
+        },
+        index=sub.index,
+    )
+    return out
+
+
+def build_paas_ci_figure(
+    paths: pd.DataFrame,
+    ci: pd.DataFrame,
+    ticker_a: str,
+    ticker_b: str,
+    lookback: int,
+    ci_window: int,
+    ci_level: float,
+) -> go.Figure:
+    dates = pd.to_datetime(paths.index.astype(str), format="%Y%m%d")
+    ci_dates = pd.to_datetime(ci.index.astype(str), format="%Y%m%d")
+    pct = int(round(ci_level * 100))
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        row_heights=[0.62, 0.38],
+        subplot_titles=(
+            f"{ticker_a} vs β_{lookback}d {pct}% CI paths (from {ticker_b} · "
+            f"CI window={ci_window} β's ≈ 6m)",
+            f"β_{lookback}d with rolling {pct}% CI endpoints",
+        ),
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=paths["PAAS_band_hi"],
+            mode="lines",
+            name="band hi",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=paths["PAAS_band_lo"],
+            mode="lines",
+            name=f"{pct}% β-path envelope",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(120,120,120,0.18)",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=paths["PAAS_from_beta_hi"],
+            mode="lines",
+            name=f"{ticker_a} from β_hi",
+            line=dict(width=1.3, color="rgba(200,60,60,0.9)"),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=paths["PAAS_from_beta_lo"],
+            mode="lines",
+            name=f"{ticker_a} from β_lo",
+            line=dict(width=1.3, color="rgba(40,100,180,0.9)"),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=paths["PAAS"],
+            mode="lines",
+            name=f"{ticker_a} actual",
+            line=dict(width=2.0, color="black"),
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=paths["PAAS_from_beta_mid"],
+            mode="lines",
+            name=f"{ticker_a} from β_med",
+            line=dict(width=1.0, color="gray", dash="dot"),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=ci_dates,
+            y=ci["beta_ci_hi"],
+            mode="lines",
+            name="β CI hi",
+            line=dict(width=1.0, color="rgba(200,60,60,0.7)"),
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=ci_dates,
+            y=ci["beta_ci_lo"],
+            mode="lines",
+            name="β CI lo",
+            line=dict(width=1.0, color="rgba(40,100,180,0.7)"),
+            fill="tonexty",
+            fillcolor="rgba(120,120,120,0.18)",
+        ),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=ci_dates,
+            y=ci["beta"],
+            mode="lines",
+            name=f"β_{lookback}d",
+            line=dict(width=1.4, color="black"),
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.update_layout(
+        height=780,
+        width=1200,
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        title_text=(
+            f"PAAS paths from rolling {pct}% CI of β_{lookback}d · "
+            f"r_A ≈ β·r_B · P̂=P₀·exp(Σ β·r_{ticker_b})"
+        ),
+    )
+    fig.update_yaxes(title_text=f"{ticker_a} price", row=1, col=1)
+    fig.update_yaxes(title_text="β", row=2, col=1)
+    fig.update_xaxes(title_text="Date", row=2, col=1)
+    return fig
+
+
 def shapiro_wilk(x: np.ndarray) -> dict:
     # SciPy caps at 5000; subsample if needed
     sample = x if len(x) <= 5000 else np.random.default_rng(42).choice(x, 5000, replace=False)
@@ -268,6 +544,9 @@ def build_report_html(
     acf_beta: dict,
     acf_dbeta: dict,
     source: str,
+    paas_ci_fig_html: str = "",
+    ci_window: int = 126,
+    ci_level: float = 0.90,
 ) -> str:
     x = beta.to_numpy(dtype=float)
     dates = pd.to_datetime(beta.index.astype(str), format="%Y%m%d")
@@ -452,6 +731,17 @@ def build_report_html(
   <h2>Plots</h2>
   {plot_html}
 
+  <h2>PAAS upper / lower from rolling {int(round(ci_level * 100))}% CI of β_{lookback}d</h2>
+  <p class="note">
+    Each day: take the trailing <b>{ci_window}</b> values of β_{lookback}d (~6 months),
+    form the empirical {int(round(ci_level * 100))}% CI (percentiles), then map endpoints into
+    {ticker_a} paths with <code>r_{ticker_a} ≈ β · r_{ticker_b}</code> and
+    <code>P̂_t = P₀ · exp(Σ β · r_{ticker_b})</code>.
+    Red = path from β_hi, blue = path from β_lo, black = actual {ticker_a}.
+    Grey band = envelope between the two β-endpoint paths.
+  </p>
+  {paas_ci_fig_html}
+
   <p class="note">
     CUSUM: W_t = Σ(β_i−β̄) / (σ√T). Crossing ±0.948 roughly rejects mean constancy at 5%
     (Brownian-bridge approximation). Nyblom L_C uses the same cumulative-sum idea with
@@ -470,6 +760,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", type=int, default=int((today - timedelta(days=800)).strftime("%Y%m%d")))
     p.add_argument("--end", type=int, default=int(today.strftime("%Y%m%d")))
     p.add_argument("--lookback", type=int, default=10, help="Rolling window for OLS beta")
+    p.add_argument(
+        "--ci-window",
+        type=int,
+        default=126,
+        help="Trailing β count for 90%% CI (~126 trading days ≈ 6 months)",
+    )
+    p.add_argument("--ci-level", type=float, default=0.90, help="CI level for beta endpoints")
+    p.add_argument(
+        "--reanchor-days",
+        type=int,
+        default=0,
+        help="Re-anchor PAAS paths to actual every N days (0 = once at first CI date)",
+    )
     p.add_argument("--data-folder", default=None)
     p.add_argument(
         "--source",
@@ -527,13 +830,37 @@ def main() -> None:
     )
 
     out_csv = args.csv
-    beta.to_frame().assign(
-        **{
-            f"logret_{args.ticker_a}": rets.loc[beta.index, f"logret_{args.ticker_a}"],
-            f"logret_{args.ticker_b}": rets.loc[beta.index, f"logret_{args.ticker_b}"],
-        }
-    ).to_csv(out_csv)
-    print(f"\nCSV: {out_csv}")
+    ci = rolling_beta_ci(beta, window=args.ci_window, level=args.ci_level)
+    paths = paas_paths_from_beta_ci(
+        rets,
+        ci,
+        args.ticker_a,
+        args.ticker_b,
+        reanchor_days=args.reanchor_days,
+    )
+    if paths.empty:
+        raise SystemExit("CI window too long for available β history — shorten --ci-window.")
+
+    export = paths.copy()
+    export[f"logret_{args.ticker_a}"] = rets.loc[paths.index, f"logret_{args.ticker_a}"]
+    export.to_csv(out_csv)
+    print(f"\nCSV: {out_csv}  (β CI + PAAS paths, N={len(paths)})")
+    print(
+        f"β CI window={args.ci_window}  level={args.ci_level:.0%}  "
+        f"mean(β_lo)={paths['beta_ci_lo'].mean():.3f}  "
+        f"mean(β_hi)={paths['beta_ci_hi'].mean():.3f}"
+    )
+
+    paas_fig = build_paas_ci_figure(
+        paths,
+        ci.loc[paths.index],
+        args.ticker_a,
+        args.ticker_b,
+        args.lookback,
+        args.ci_window,
+        args.ci_level,
+    )
+    paas_ci_html = paas_fig.to_html(full_html=False, include_plotlyjs=False)
 
     html = build_report_html(
         beta,
@@ -547,6 +874,9 @@ def main() -> None:
         acf_beta,
         acf_dbeta,
         src,
+        paas_ci_fig_html=paas_ci_html,
+        ci_window=args.ci_window,
+        ci_level=args.ci_level,
     )
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(html)
