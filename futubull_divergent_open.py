@@ -1,17 +1,18 @@
 class Strategy(StrategyBase):
     """
-    Divergent fade: day t-1 PAAS↑ & SLV↓ → day t short PAAS / long SLV (open→close).
+    Divergent fade + per-leg TP 0.1%.
 
-    Signal (close-to-close on prior day):
-      r_PAAS > 0 and r_SLV < 0  →  SHORT PAAS / LONG SLV
-      both_sides=1 also:
-      r_PAAS < 0 and r_SLV > 0  →  LONG PAAS / SHORT SLV
+    Signal (prior day close-to-close):
+      r_PAAS > 0 and r_SLV < 0  →  SHORT PAAS / LONG SLV at open
+      both_sides=1 also trades the opposite.
 
-    Enter near open (after skip_bars=1), exit at eod_bars.
-    Equal $ notional — no beta.
+    Exit each leg independently when it moves tp_pct% in your favor:
+      short leg: price <= entry * (1 - tp_pct/100)
+      long leg:  price >= entry * (1 + tp_pct/100)
+    Any remaining leg is flattened at EOD.
 
     BACKTEST:
-      Trigger1=US.PAAS, Trigger2=US.SLV, both 1m candle at close
+      Trigger1=US.PAAS, Trigger2=US.SLV, 1m candle at close
       Margin + short ON, cash >= 40000
     """
 
@@ -28,6 +29,7 @@ class Strategy(StrategyBase):
 
     def global_variables(self):
         self.notional = show_variable(10000, GlobalType.INT)
+        self.tp_pct = show_variable(0.1, GlobalType.FLOAT)
         self.both_sides = show_variable(0, GlobalType.INT)
         self.skip_bars = show_variable(1, GlobalType.INT)
         self.eod_bars = show_variable(385, GlobalType.INT)
@@ -50,6 +52,10 @@ class Strategy(StrategyBase):
         self.direction = 0
         self.shares_paas = 0
         self.shares_slv = 0
+        self.entry_paas = 0.0
+        self.entry_slv = 0.0
+        self.open_paas_leg = 0
+        self.open_slv_leg = 0
         self.last_bar_key = ""
 
     def handle_data(self):
@@ -65,7 +71,6 @@ class Strategy(StrategyBase):
             return
         self.last_bar_key = bar_key
 
-        # New session
         if self.session_bars >= int(self.eod_bars):
             self._end_of_day(paas, slv)
             self.session_bars = 0
@@ -73,17 +78,16 @@ class Strategy(StrategyBase):
 
         self.session_bars = self.session_bars + 1
 
-        # Enter near open if yesterday's signal qualifies
-        if self.in_position == 0 and self.entered_today == 0:
-            if self.session_bars > int(self.skip_bars):
-                self._maybe_enter(paas, slv)
+        if self.in_position == 1:
+            self._manage_legs(paas, slv)
+            if self.session_bars >= int(self.eod_bars) - 1:
+                self._flatten_remaining(paas, slv)
+            return
 
-        # Flatten near EOD
-        if self.in_position == 1 and self.session_bars >= int(self.eod_bars) - 1:
-            self._flatten(paas, slv)
+        if self.entered_today == 0 and self.session_bars > int(self.skip_bars):
+            self._maybe_enter(paas, slv)
 
     def _end_of_day(self, paas, slv):
-        # Close-to-close return for TODAY becomes tomorrow's signal
         if self.has_prev_close == 1:
             self.signal_ret_paas = paas / self.prev_close_paas - 1.0
             self.signal_ret_slv = slv / self.prev_close_slv - 1.0
@@ -92,7 +96,7 @@ class Strategy(StrategyBase):
         self.prev_close_slv = slv
         self.has_prev_close = 1
         if self.in_position == 1:
-            self._flatten(paas, slv)
+            self._flatten_remaining(paas, slv)
 
     def _signal_direction(self):
         if self.has_signal != 1:
@@ -132,21 +136,73 @@ class Strategy(StrategyBase):
         self.direction = direction
         self.shares_paas = qty_paas
         self.shares_slv = qty_slv
+        self.entry_paas = paas
+        self.entry_slv = slv
+        self.open_paas_leg = 1
+        self.open_slv_leg = 1
 
         if int(self.alert_on_signal) == 1:
-            alert(content="ENTRY dir={} rP={:.3f} rS={:.3f} PAAS={} SLV={}".format(
-                direction, self.signal_ret_paas, self.signal_ret_slv, qty_paas, qty_slv))
+            alert(content="ENTRY dir={} rP={:.3f} rS={:.3f}".format(
+                direction, self.signal_ret_paas, self.signal_ret_slv))
 
-    def _flatten(self, paas, slv):
-        if self.in_position != 1:
-            return
-        self._close_pair()
-        if int(self.alert_on_signal) == 1:
-            alert(content="EXIT EOD PAAS={} SLV={}".format(paas, slv))
+    def _manage_legs(self, paas, slv):
+        thr = float(self.tp_pct) / 100.0
+        d = self.direction
+
+        # Close PAAS leg on TP
+        if self.open_paas_leg == 1:
+            hit = 0
+            if d > 0:
+                # short PAAS
+                if paas <= self.entry_paas * (1.0 - thr):
+                    hit = 1
+            else:
+                # long PAAS
+                if paas >= self.entry_paas * (1.0 + thr):
+                    hit = 1
+            if hit == 1:
+                self._close_paas_leg()
+                self.open_paas_leg = 0
+                self.shares_paas = 0
+                if int(self.alert_on_signal) == 1:
+                    alert(content="TP PAAS @ {}".format(paas))
+
+        # Close SLV leg on TP
+        if self.open_slv_leg == 1:
+            hit = 0
+            if d > 0:
+                # long SLV
+                if slv >= self.entry_slv * (1.0 + thr):
+                    hit = 1
+            else:
+                # short SLV
+                if slv <= self.entry_slv * (1.0 - thr):
+                    hit = 1
+            if hit == 1:
+                self._close_slv_leg()
+                self.open_slv_leg = 0
+                self.shares_slv = 0
+                if int(self.alert_on_signal) == 1:
+                    alert(content="TP SLV @ {}".format(slv))
+
+        if self.open_paas_leg == 0 and self.open_slv_leg == 0:
+            self.in_position = 0
+            self.direction = 0
+
+    def _flatten_remaining(self, paas, slv):
+        if self.open_paas_leg == 1:
+            self._close_paas_leg()
+            self.open_paas_leg = 0
+            self.shares_paas = 0
+        if self.open_slv_leg == 1:
+            self._close_slv_leg()
+            self.open_slv_leg = 0
+            self.shares_slv = 0
+        if self.in_position == 1:
+            if int(self.alert_on_signal) == 1:
+                alert(content="EXIT EOD flatten")
         self.in_position = 0
         self.direction = 0
-        self.shares_paas = 0
-        self.shares_slv = 0
 
     def _target_qty(self, price):
         qty = int(float(self.notional) / price)
@@ -188,18 +244,26 @@ class Strategy(StrategyBase):
             place_market(symbol=self.trig_symbol_paas, qty=qty_paas, side=OrderSide.BUY)
             place_market(symbol=self.trig_symbol_slv, qty=qty_slv, side=OrderSide.SELL)
 
-    def _close_pair(self):
+    def _close_paas_leg(self):
+        if self.shares_paas < 1:
+            return
         if self.direction > 0:
-            qty_a = self._cap_buy_qty(self.trig_symbol_paas, self.shares_paas)
-            qty_b = self._cap_sell_qty(self.trig_symbol_slv, self.shares_slv)
-            if qty_a >= 1:
-                place_market(symbol=self.trig_symbol_paas, qty=qty_a, side=OrderSide.BUY)
-            if qty_b >= 1:
-                place_market(symbol=self.trig_symbol_slv, qty=qty_b, side=OrderSide.SELL)
+            qty = self._cap_buy_qty(self.trig_symbol_paas, self.shares_paas)
+            if qty >= 1:
+                place_market(symbol=self.trig_symbol_paas, qty=qty, side=OrderSide.BUY)
         else:
-            qty_a = self._cap_sell_qty(self.trig_symbol_paas, self.shares_paas)
-            qty_b = self._cap_buy_qty(self.trig_symbol_slv, self.shares_slv)
-            if qty_a >= 1:
-                place_market(symbol=self.trig_symbol_paas, qty=qty_a, side=OrderSide.SELL)
-            if qty_b >= 1:
-                place_market(symbol=self.trig_symbol_slv, qty=qty_b, side=OrderSide.BUY)
+            qty = self._cap_sell_qty(self.trig_symbol_paas, self.shares_paas)
+            if qty >= 1:
+                place_market(symbol=self.trig_symbol_paas, qty=qty, side=OrderSide.SELL)
+
+    def _close_slv_leg(self):
+        if self.shares_slv < 1:
+            return
+        if self.direction > 0:
+            qty = self._cap_sell_qty(self.trig_symbol_slv, self.shares_slv)
+            if qty >= 1:
+                place_market(symbol=self.trig_symbol_slv, qty=qty, side=OrderSide.SELL)
+        else:
+            qty = self._cap_buy_qty(self.trig_symbol_slv, self.shares_slv)
+            if qty >= 1:
+                place_market(symbol=self.trig_symbol_slv, qty=qty, side=OrderSide.BUY)
